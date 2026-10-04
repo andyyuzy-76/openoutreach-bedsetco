@@ -1,0 +1,14 @@
+[project]
+name = "bedsetco-outreach-workbench"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["openoutreach", "openoutfind", "openoutsend"]
+
+[tool.uv]
+package = false
+override-dependencies = ["openoutfind", "openoutsend"]
+
+[tool.uv.sources]
+openoutreach = { path = "src/OpenOutreach", editable = true }
+openoutfind = { path = "src/OpenOutFind", editable = true }
+openoutsend = { path = "src/OpenOutSend", editable = true }

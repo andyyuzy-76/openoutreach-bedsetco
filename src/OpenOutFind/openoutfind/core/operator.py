@@ -1,0 +1,55 @@
+"""Who is running this install.
+
+Self-hosted means one operator, so identity is a lookup, not a parameter. This
+replaces the ``OperatorSession`` object that used to be threaded through every
+call: it was the browser era's session handle, and once the browser went there was
+nothing session-like left in it — just the Django ``User``. The operator is looked
+up here.
+
+Nothing is cached across calls. Both reads are a single indexed row and happen at
+most once per cycle; a cache would only add a way for a renamed operator to keep
+signing emails with their old name until the daemon restarts.
+"""
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_active_user():
+    """The Django ``User`` running the daemon (the onboarded operator)."""
+    from django.contrib.auth.models import User
+
+    return User.objects.filter(is_active=True, is_staff=True).order_by("pk").first()
+
+
+def self_profile() -> dict:
+    """The operator's own identity, synthesized (not scraped).
+
+    Name comes from the Django user (the agents read ``first_name`` for the seller
+    binding, falling back to the username), country from ``SiteConfig``. The contacts
+    store uses ``public_identifier`` (the operator email) as the stable operator key.
+    """
+    from openoutfind.core.config import SiteConfig
+
+    user = get_active_user()
+    return {
+        "public_identifier": user.email or user.username,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "operator_country_code": SiteConfig.load().operator_country_code or "",
+    }
+
+
+def seller_name() -> str:
+    """The seller's first name as the LLM knows it, with a username fallback."""
+    profile = self_profile()
+    return (profile.get("first_name") or "").strip() or get_active_user().username
+
+
+def seller_full_name() -> str:
+    """The seller's full name for the prompt's identity binding."""
+    profile = self_profile()
+    full = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
+    return full or get_active_user().username

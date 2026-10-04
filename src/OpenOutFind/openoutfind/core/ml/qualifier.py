@@ -1,0 +1,565 @@
+# openoutfind/core/ml/qualifier.py
+"""GP Regression qualifier: BALD active learning via exact GP posterior.
+
+The domain-agnostic engine (the GP pipeline, P(f>0.5), BALD, the balance-driven
+acquisition axis) lives in ``openoutlearn.GPBaldQualifier`` — extracted once this
+module and OpenOutNews's qualifier had converged on identical code under two
+different domain labels. ``BayesianQualifier`` adds what's genuinely lead-gen
+specific: cold-start anchors, majority-class balancing gated on the cold phase,
+and the Django-backed ranking/explain helpers.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from typing import Protocol, runtime_checkable
+
+import jinja2
+import numpy as np
+from pydantic import BaseModel, Field
+
+from openoutlearn.qualifier import GPBaldQualifier, binary_entropy, gpr_predict, prob_above_half
+
+from openoutfind.core.conf import CAMPAIGN_CONFIG, PROMPTS_DIR
+
+logger = logging.getLogger(__name__)
+
+# Kept as module-level aliases: tests and other modules import these by the old
+# private names.
+_binary_entropy = binary_entropy
+_prob_above_half = prob_above_half
+_gpr_predict = gpr_predict
+
+
+# ---------------------------------------------------------------------------
+# Qualifier protocol
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class Qualifier(Protocol):
+    """Common interface for all qualifier implementations.
+
+    ``rank_profiles`` returns profiles sorted by score (descending).
+    Returns ``[]`` on cold start or when ranking is impossible.
+
+    ``explain`` returns a human-readable scoring summary for a single profile.
+
+    ``predict_probs`` returns P(f > 0.5) per embedding, or ``None`` when the model
+    cannot score yet. It belongs here rather than on one implementation because the
+    cycle's promote gate (``ready_pool.promote_to_ready``) runs for **every**
+    campaign — leaving it off the protocol once let a campaign reach the gate with a
+    qualifier that had no such method, and `AttributeError` every other cycle.
+
+    There is only one implementation today (``BayesianQualifier``); the protocol is
+    kept because the gate should keep depending on the interface rather than on it.
+    """
+
+    def rank_profiles(self, profiles: list) -> list: ...
+    def explain(self, profile: dict) -> str: ...
+    def predict_probs(self, embeddings: np.ndarray) -> np.ndarray | None: ...
+
+
+def format_prediction(prob: float, entropy: float, std: float, n_obs: int) -> str:
+    """Compact one-liner stats string for qualification logging."""
+    return f"P(f>0.5)={prob:.3f}, entropy={entropy:.4f}, std={std:.4f}, obs={n_obs}"
+
+
+class QualificationDecision(BaseModel):
+    """Structured LLM output for lead qualification."""
+    qualified: bool = Field(description="True if the profile is a good prospect, False otherwise")
+    reason: str = Field(description="Brief explanation for the decision")
+
+
+def qualify_with_llm(profile_text: str, product_docs: str, campaign_target: str) -> tuple[int, str]:
+    """Call LLM to qualify a profile. Returns (label, reason).
+
+    label: 1 = accept, 0 = reject.
+    """
+    from pydantic_ai import Agent
+
+    from openoutfind.core.llm import get_llm_model, run_agent_sync
+
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(PROMPTS_DIR)))
+    template = env.get_template("qualify_lead.j2")
+
+    prompt = template.render(
+        product_docs=product_docs,
+        campaign_target=campaign_target,
+        profile_text=profile_text,
+    )
+
+    agent = Agent(
+        get_llm_model(),
+        output_type=QualificationDecision,
+        model_settings={"temperature": 0.7, "timeout": 60},
+    )
+    decision = run_agent_sync(agent.run(prompt)).output
+
+    label = 1 if decision.qualified else 0
+    return (label, decision.reason)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers  (Django-coupled — not part of the extracted engine)
+# ---------------------------------------------------------------------------
+
+def _load_profile_embeddings(profiles: list, *, skip_missing: bool = False):
+    """Load cached embeddings for a list of profile dicts.
+
+    Returns list of (profile, embedding) pairs. Reads the cached
+    ``Lead.embedding_array`` only — no scrape, so an unembedded lead is missing.
+    """
+    from openoutfind.crm.models import Lead
+
+    result = []
+    for p in profiles:
+        lead = Lead.objects.filter(pk=p.get("lead_id")).first()
+        emb = lead.embedding_array if lead else None
+        if emb is None:
+            if skip_missing:
+                continue
+            pid = p.get("profile_url", "?")
+            raise RuntimeError(f"No embedding found for profile {pid}")
+        result.append((p, emb))
+    return result
+
+
+def _rank_by_score(profiles: list, pipeline, *, skip_missing: bool = False) -> list:
+    """Rank profiles by raw pipeline.predict() score (descending).
+
+    Works with any sklearn-compatible pipeline — no GPR-specific logic.
+    """
+    scored = _load_profile_embeddings(profiles, skip_missing=skip_missing)
+    if not scored:
+        return []
+
+    X = np.array([emb for _, emb in scored], dtype=np.float64)
+    scores = pipeline.predict(X)
+
+    ranked = sorted(zip(scores, [p for p, _ in scored]), key=lambda t: t[0], reverse=True)
+    return [p for _, p in ranked]
+
+
+def _explain_score(pipeline, embedding: np.ndarray) -> float:
+    """Return the raw prediction score for a single embedding."""
+    X = np.asarray(embedding, dtype=np.float64)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    return float(pipeline.predict(X)[0])
+
+
+# ---------------------------------------------------------------------------
+# BayesianQualifier  (GP Regression backend)
+# ---------------------------------------------------------------------------
+
+class BayesianQualifier(GPBaldQualifier):
+    """The shared GP+BALD engine (``openoutlearn.GPBaldQualifier``), plus what's
+    genuinely lead-gen specific: cold-start anchors, majority-class balancing
+    gated on the cold phase, and Django-backed ranking/explain.
+
+    Training data is accumulated incrementally; the GPR is lazily
+    re-fitted on ALL accumulated data (real observations + anchors)
+    whenever predictions are needed.
+    """
+
+    def __init__(self, seed: int = 42, embedding_dim: int = 384, n_mc_samples: int = 100):
+        super().__init__(seed=seed, embedding_dim=embedding_dim, n_mc_samples=n_mc_samples)
+        # Synthetic ideal-lead embeddings, all label 1 — kept apart from the real
+        # observations, and permanent: they are never trimmed as real positives
+        # arrive. See ``set_anchors``.
+        self._anchor_X: list[np.ndarray] = []
+
+    @property
+    def n_obs(self) -> int:
+        return len(self._y) + len(self._anchor_X)
+
+    @property
+    def class_counts(self) -> tuple[int, int]:
+        """Return (n_negatives, n_positives) — anchors counted as positives.
+
+        The anchors are permanent, so they always contribute to the positive count,
+        not just while the cold phase lasts.
+        """
+        n_pos = sum(self._y) + len(self._anchor_X)
+        return len(self._y) - sum(self._y), n_pos
+
+    @property
+    def n_anchors(self) -> int:
+        """How many invented positives are standing — always ``ANCHOR_COUNT`` once set."""
+        return len(self._anchor_X)
+
+    @property
+    def n_real_positives(self) -> int:
+        """How many real leads have qualified."""
+        return sum(self._y)
+
+    @property
+    def has_real_positive(self) -> bool:
+        """Whether a real lead has ever qualified.
+
+        Not the phase test (that is ``is_cold``): the anchors stand regardless, so this
+        only tells the caller whether ground truth exists alongside them.
+        """
+        return any(self._y)
+
+    @property
+    def is_cold(self) -> bool:
+        """Whether the positive class is still mostly invented — the engine's phase test.
+
+        The anchors themselves are permanent (``set_anchors`` never trims them), but the
+        phase clock is independent of that: it is ``n_real_positives < ANCHOR_COUNT``, the
+        same threshold the anchors were sized to. Once real acceptances reach that count,
+        balancing (``_balance``) and the explore/exploit split (``top_up._advance``) take
+        over even though the anchors keep contributing to every fit after that — there is
+        simply enough real evidence for the balance to be meaningful around them.
+        """
+        from openoutfind.core.pipeline.icp import ANCHOR_COUNT
+
+        if not self._anchor_X:
+            return False
+        return self.n_real_positives < ANCHOR_COUNT
+
+    # ``update`` is inherited from ``GPBaldQualifier`` unchanged: the anchors are
+    # never touched by it — a positive label adds to the real positive class
+    # alongside them, it does not displace any of the invented ones.
+
+    # ------------------------------------------------------------------
+    # Anchors  (synthetic positives for the cold phase)
+    # ------------------------------------------------------------------
+
+    def set_anchors(self, embeddings: np.ndarray):
+        """Set the synthetic positives so the GP can fit before any real lead qualifies.
+
+        Without them a first run is unfittable, not merely uninformed: every verdict is
+        a rejection until the ICP is right, one class yields no posterior, and BALD,
+        P(f>0.5), the promote gate and the query selector all go dark together for the
+        whole cold phase. One imagined positive region restores every one of them.
+
+        **Replaces** the anchor set rather than adding to it — the caller owns the whole
+        set (``icp.ensure_anchors`` returns every profile written so far), so passing the
+        stored set again on a daemon boot is a no-op. They are never trimmed afterwards:
+        the anchors stand for the campaign's whole life, alongside whatever real
+        positives arrive.
+        """
+        self._anchor_X = [np.asarray(e, dtype=np.float64).ravel() for e in embeddings]
+        self._fitted = False
+
+    def _training_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        """Real observations plus any anchors, as ``(X, y)`` — what the GP fits on."""
+        X = self._X + self._anchor_X
+        y = self._y + [1] * len(self._anchor_X)
+        return np.array(X, dtype=np.float64), np.array(y, dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Lazy refit
+    # ------------------------------------------------------------------
+
+    # Maximum ratio of majority-to-minority samples for GP fitting.
+    # Beyond this, the majority class is subsampled to prevent degenerate
+    # predictions when labels are heavily imbalanced.
+    _MAX_IMBALANCE_RATIO = 2
+
+    def _fit_if_needed(self) -> bool:
+        """Fit StandardScaler + GPR pipeline if dirty and feasible.  Returns True when model is usable."""
+        if self._fitted:
+            return True
+        X_arr, y_arr = self._training_arrays()
+        if len(y_arr) < 2:
+            return False
+        if len(np.unique(y_arr)) < 2:
+            return False  # need both classes
+
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, RBF
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        # Balancing guards against one *observed* class swamping the other, and is skipped
+        # during the cold phase: subsampling would throw away real rejections to match a
+        # positive class still mostly invented. It takes over once real acceptances reach
+        # ANCHOR_COUNT — the anchors keep contributing after that, but there is now enough
+        # real evidence for the balance to mean something.
+        X_fit, y_fit = (X_arr, y_arr) if self.is_cold else self._balance(X_arr, y_arr)
+        n = X_fit.shape[0]
+
+        self._pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('gpr', GaussianProcessRegressor(
+                kernel=ConstantKernel(1.0) * RBF(length_scale=np.sqrt(self.embedding_dim)),
+                n_restarts_optimizer=3,
+                random_state=self._seed,
+                alpha=0.1,
+            )),
+        ])
+        # Announced *before* it runs, not after. This is the run's one genuinely
+        # expensive step and it grows as O(n³) in the label count — 17s at 1,220
+        # labels — so a line that only appears on completion means the longest stall
+        # in the loop is the one stretch with nothing on screen to explain it.
+        logger.info("training the ranking model on %d judged lead(s)%s "
+                    "— the slowest thing a run does, please wait",
+                    n, f", {len(self._anchor_X)} of them still synthetic"
+                       if self._anchor_X else "")
+        started = time.monotonic()
+        self._pipeline.fit(X_fit, y_fit)
+        lml = self._pipeline.named_steps['gpr'].log_marginal_likelihood_value_
+
+        self._fitted = True
+        logger.info("ranking model trained on %d judged lead(s) in %.1fs",
+                    n, time.monotonic() - started)
+        logger.debug("GPR fitted on %d observations (%d anchors, %d after balancing, "
+                      "LML=%.2f)", self.n_obs, len(self._anchor_X), n, lml)
+        return True
+
+    def _balance(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Subsample the majority class to at most _MAX_IMBALANCE_RATIO * minority.
+
+        Prevents the GP from becoming degenerate when one class dominates.
+        Keeps all minority samples and selects majority samples randomly.
+        """
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        n_min = min(n_pos, n_neg)
+        n_max = max(n_pos, n_neg)
+        cap = self._MAX_IMBALANCE_RATIO * n_min
+
+        if n_max <= cap:
+            return X, y  # already balanced enough
+
+        minority_label = 1.0 if n_pos < n_neg else 0.0
+        minority_idx = np.where(y == minority_label)[0]
+        majority_idx = np.where(y != minority_label)[0]
+
+        chosen = self._rng.choice(majority_idx, size=cap, replace=False)
+        keep = np.concatenate([minority_idx, chosen])
+        keep.sort()
+
+        logger.debug(
+            "Balancing training set: %d → %d (kept all %d minority, "
+            "subsampled %d → %d majority)",
+            len(y), len(keep), n_min, n_max, cap,
+        )
+        return X[keep], y[keep]
+
+    # ------------------------------------------------------------------
+    # Prediction  (needs posterior std — uses _gpr_predict)
+    # ------------------------------------------------------------------
+
+    def predict(self, embedding: np.ndarray) -> tuple[float, float, float] | None:
+        """Return (predictive_prob, predictive_entropy, posterior_std) for a single embedding.
+
+        Probability is P(f > 0.5) from the GP posterior, which naturally
+        incorporates uncertainty and stays in [0, 1] without clipping.
+        Returns None when the model cannot be fitted yet.
+        """
+        if not self._fit_if_needed():
+            return None
+        mean, std = _gpr_predict(self._pipeline, embedding)
+        p = float(_prob_above_half(mean, std)[0])
+        entropy = float(_binary_entropy(p))
+        return p, entropy, float(std[0])
+
+    # ``compute_bald`` and ``predict_probs`` are inherited from ``GPBaldQualifier``
+    # unchanged — both dispatch through ``self._fit_if_needed()``, which resolves to
+    # this class's override below, so anchors and balancing apply automatically.
+
+    def posterior_std(self, embeddings: np.ndarray) -> np.ndarray | None:
+        """GP posterior std at each embedding — the uncertainty BALD rewards.
+
+        The explore prefilter ranks candidate queries by summed per-clause variance
+        (posterior_std²) as a cheap BALD proxy, so only the top slice is exact-embedded.
+        Returns None when the model cannot be fitted yet.
+        """
+        if not self._fit_if_needed():
+            return None
+        _, std = _gpr_predict(self._pipeline, embeddings)
+        return std
+
+    def acquisition_mode(self, embeddings: np.ndarray | None = None) -> str | None:
+        """The live acquisition axis: ``"exploit (p)"``, ``"explore (BALD)"``, or None.
+
+        **Cold phase — always exploit.** While any anchor is still padding the positive
+        class, the campaign has exactly one goal: *more real positives*, because each one
+        displaces an invented one and the last of them ends the phase, turning every
+        downstream ranking into one backed by ground truth. Exploit serves it directly —
+        the highest-P lead is the one most like the ideal profile, so it is the likeliest
+        genuine fit.
+
+        The class balance cannot decide the axis during that phase, and it is not merely
+        that it would decide wrong: the anchors are *held at* the shortfall, so
+        ``n_neg > n_pos`` is false by construction and the balance has no information in
+        it at all.
+
+        BALD serves the opposite. Information gain is the right objective when both
+        classes are real and the question is where the boundary sits; with invented
+        positives it spends every LLM call on the lead the model is *most confused*
+        about, which is precisely the lead least like the ICP. A live run made that
+        concrete — four consecutive picks at P(f>0.5) ≈ 0.25–0.42, and the verdicts were
+        veterinary services, cybersecurity education, K-12 tutoring and a metaverse
+        product manager, against a health-and-wellness ICP. Every one an accurate
+        rejection, and not one of them a step toward the first acceptance.
+
+        Past the cold phase it is balance-driven as before: exploit once real negatives
+        outnumber real positives, explore while the classes are still even.
+
+        None on cold start (model not fitted yet). Exposed so callers can pick which
+        cheap prefilter to run *before* they exact-embed.
+        """
+        if not self._fit_if_needed():
+            return None
+        if self.is_cold:
+            return "exploit (p)"
+        n_neg, n_pos = self.class_counts
+        return "exploit (p)" if n_neg > n_pos else "explore (BALD)"
+
+    # ``acquisition_scores`` is inherited unchanged — it dispatches on
+    # ``self.acquisition_mode()``, which resolves to this class's cold-phase-aware
+    # override.
+
+    # ------------------------------------------------------------------
+    # Ranking & explain  (raw GP mean — no _prob_above_half)
+    # ------------------------------------------------------------------
+
+    def rank_profiles(self, profiles: list) -> list:
+        """Rank QUALIFIED profiles by raw GP mean (descending).
+
+        Returns ``[]`` on cold start (model not fitted yet).
+        """
+        if not profiles:
+            return []
+        if not self._fit_if_needed():
+            logger.debug("rank_profiles: GPR not fitted (%d obs) — returning empty", self.n_obs)
+            return []
+        return _rank_by_score(profiles, self._pipeline)
+
+    def explain(self, profile: dict) -> str:
+        """Human-readable compact scoring explanation."""
+        from openoutfind.crm.models import Lead
+
+        lead = Lead.objects.filter(pk=profile.get("lead_id")).first()
+        emb = lead.embedding_array if lead else None
+        if emb is None:
+            return "No embedding found for profile"
+        if not self._fit_if_needed():
+            return f"Model not fitted yet ({self.n_obs} observations, need both classes)"
+        mean, std = _gpr_predict(self._pipeline, emb)
+        gp_mean = float(mean[0])
+        p_above = float(_prob_above_half(mean, std)[0])
+        return f"mean={gp_mean:.3f}, P(f>0.5)={p_above:.3f}, obs={self.n_obs}"
+
+    # ``warm_start`` is inherited from ``GPBaldQualifier`` unchanged: it replaces the
+    # *real* observations only — anchors are set separately and after, so the build
+    # order (warm_start, then anchor) holds regardless of which runs first.
+    #
+    # **It used to fit eagerly here, and that fit was always thrown away.**
+    # ``qualifier_for`` loads the labels and then calls ``set_anchors``, which marks
+    # the model dirty again, so every construction paid for two fits over the same
+    # evidence — one on the real labels alone and one on the labels plus the anchors
+    # — and only the second was ever asked a question. At 230 labels that was 7s
+    # spent to be discarded, and it grows as O(n³). Nothing in this class fits
+    # eagerly; ``_fit_if_needed`` runs on the first prediction, which is the point at
+    # which the training set has stopped changing.
+
+
+# ``KitQualifier`` stood here — a pre-trained GPR downloaded from HuggingFace, used
+# only by the freemium promo campaign, which had no labels of its own to fit on. It
+# went with that campaign; every qualifier is now a ``BayesianQualifier`` fitted on
+# the operator's own verdicts.
+
+
+# ── On-demand construction ────────────────────────────────────────
+
+# The fitted model, kept under the fingerprint of the evidence it was fitted on.
+# Process-local — one install, one qualifier — so this holds at most one model.
+_FITTED: tuple[str, "BayesianQualifier"] | None = None
+
+
+def _label_fingerprint() -> str:
+    """A digest of everything the fit reads: which lead carries which verdict, and the
+    anchors.
+
+    Deliberately *not* a timestamp or a row count. A count cannot see a verdict being
+    corrected, and ``updated_at`` moves when a deal changes **state** — which happens
+    constantly (promoted, address ordered, resolved) and changes nothing the GP is fitted
+    on. This projects the deals down to exactly what ``Lead.get_labeled_arrays`` keeps,
+    so two fingerprints are equal precisely when a refit would land on the same numbers.
+
+    One small query — microseconds against a fit that is seconds, and grows as O(n³)
+    while this grows linearly.
+    """
+    from openoutfind.crm.models import Deal, DealState, Lead, Outcome
+
+    labels = sorted(
+        (lead_id, 0 if outcome == Outcome.WRONG_FIT else 1)
+        for lead_id, state, outcome in Deal.objects.filter(
+            lead_id__isnull=False,
+        ).values_list("lead_id", "state", "outcome")
+        # Same three-way reading as ``get_labeled_arrays``: a rejection is a 0, anything
+        # not FAILED is a 1, and a FAILED deal that failed for some other reason is not
+        # evidence about fit at all.
+        if state != DealState.FAILED or outcome == Outcome.WRONG_FIT
+    )
+    digest = hashlib.sha256(repr(labels).encode())
+    # The anchors are fitted alongside the real labels, so a first anchor-set generation
+    # has genuinely changed the training data.
+    digest.update(repr(sorted(
+        Lead.objects.filter(synthetic=True).values_list("pk", flat=True))).encode())
+    return digest.hexdigest()
+
+
+def qualifier_for():
+    """The install's qualifier, ready to score. **Fitted once per label set.**
+
+    Built where it is needed rather than warm-started at boot and held for the life of
+    the process. A resident model is a model that silently goes stale: the daemon used to
+    fit the GP at startup, so a label written an hour later did not move the posterior
+    until the next restart.
+
+    **The cache answers that objection instead of reopening it**, because its key *is*
+    the evidence (``_label_fingerprint``). A model can only be handed back when a refit
+    would have reproduced it exactly, and the one thing that can change what the GP would
+    say — an LLM verdict — always changes the key.
+
+    Which matters because the fit is O(n³) and the loop above is per *action*: 15s at 310
+    labels, minutes at 600, and a run pays it on every action forever. Almost none of
+    those actions touch a label. Discovery writes unlabelled leads and moves a node's
+    offset; buying an address and checking a lookup move a deal's state. Each one used to
+    be followed by a full refit to the same posterior — which was most of a run's wall
+    clock, all of it spent recomputing an answer we already had.
+
+    It used to be able to return ``None``, for the one case where the freemium
+    campaign's downloaded kit was unavailable. With that campaign gone there is no
+    such case: the install fits on its own labels, or on its anchors when it has none.
+    """
+    global _FITTED
+    from openoutfind.core.conf import CAMPAIGN_CONFIG
+    from openoutfind.core.config import SiteConfig
+    from openoutfind.core.pipeline.icp import ensure_anchors, stored_anchors
+    from openoutfind.crm.models import Lead
+
+    if _FITTED is not None and _FITTED[0] == _label_fingerprint():
+        logger.debug("ranking model: reusing the fit — no verdict since")
+        return _FITTED[1]
+
+    qualifier = BayesianQualifier(
+        seed=42,
+        n_mc_samples=CAMPAIGN_CONFIG["qualification_n_mc_samples"],
+    )
+    X, y = Lead.get_labeled_arrays()
+    if len(X) > 0:
+        qualifier.warm_start(X, y)
+
+    # Cold phase — the positive class is partly invented, permanently. With no
+    # acceptance at all the labels are one class and the GP cannot fit, so generate
+    # the anchors; once real positives have started arriving, restore the same
+    # stored set rather than inventing more — it never grows or shrinks again.
+    anchors = (stored_anchors() if qualifier.has_real_positive
+               else ensure_anchors(SiteConfig.load()))
+    if anchors is not None:
+        qualifier.set_anchors(anchors)
+
+    # Fingerprinted *after* the build, because ``ensure_anchors`` may have just written
+    # the first anchor set — keying on the pre-build state would miss on the very next
+    # call and refit for nothing.
+    _FITTED = (_label_fingerprint(), qualifier)
+    return qualifier

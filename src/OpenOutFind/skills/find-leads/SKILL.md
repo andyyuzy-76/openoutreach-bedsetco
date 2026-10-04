@@ -1,0 +1,284 @@
+---
+name: find-leads
+description: Find qualified B2B leads with OpenOutFind — run `outfind find N [emails]`, read the CSV it prints on stdout, and hand the rows to whatever sends. Use when the user wants leads, prospects, an ICP-matched contact list, or asks what a campaign already has. Also covers first-run setup (`outfind check`), `outfind status`, and when a lookup costs money.
+user-invocable: true
+argument-hint: [N] [emails]
+---
+
+# Finding leads with OpenOutFind
+
+OpenOutFind is a self-hosted CLI lead finder. You describe a product and a target market once;
+each run discovers candidates from a licensed data source, has an LLM judge each one against that
+ICP, **writes down why**, and prints every lead it has as CSV on stdout.
+
+It is one bounded command: ask for an amount, get rows, exit. **There is no daemon, no background
+job, no file the tool writes for the operator, and nothing to poll.** If you find yourself wanting
+to tail a log or wait for something, you have the wrong model of this tool.
+
+It does **not** send email. The deliverable is a CSV for whatever the user already sends with.
+
+## Is it installed?
+
+```bash
+outfind status          # human summary
+outfind status --json   # the same document, for you to parse
+```
+
+If the command is missing, run it through `uvx` instead — `uvx openoutfind ...` — or install it
+with `pip install openoutfind`. Inside a checkout of the repo, `python manage.py <verb>` is the
+same entry point.
+
+`status` never blocks and never spends. It answers `config` (complete, or which `OPENOUTFIND_*`
+variables are missing), lead and deal counts, the credit balance, anything `blocked`, and a
+`next_action` — start there whenever you are unsure what state the user is in.
+
+## Setup, if `status` says the configuration is incomplete
+
+**Configuration is the environment, and nothing is stored.** There is no wizard here and no config
+row: every value is read from `OPENOUTFIND_*` on every run, so setting up an install means exporting
+these — which is also why nothing ever has to be re-entered in a container or a CI job.
+
+| Group | Environment variables |
+|------|----------------------|
+| campaign | `OPENOUTFIND_PRODUCT_DOCS`, `OPENOUTFIND_CAMPAIGN_TARGET`; optional `OPENOUTFIND_MAX_PER_COMPANY` — at most N fits from one company |
+| llm | `OPENOUTFIND_AI_MODEL`, `OPENOUTFIND_LLM_API_KEY` |
+| bettercontact | `OPENOUTFIND_BETTERCONTACT_API_KEY` |
+| account | optional: `OPENOUTFIND_OPERATOR_EMAIL` — the install's contacts-store identity; `OPENOUTFIND_OPERATOR_COUNTRY` — an EEA/UK/CH country stops contributing to the contacts store |
+
+```bash
+outfind check           # is this install configured? creates the database, spends nothing
+```
+
+`check` creates the database, verifies the model answers to the key it was given, prints what this
+run was told, and stops **before spending anything**.
+
+The product description and target market are pages of prose, so pass them as files rather than
+shell-quoted strings — quoting a markdown paragraph on a command line corrupts it quietly:
+
+```bash
+outfind check --product-docs product.md --target target.md
+```
+
+You never need to run `check` first — `find` checks the same things — but do run it when the user
+has not configured anything, because it fails cheaply and prints the configuration it read, so a
+misread product description is caught before any work.
+
+## The one work verb
+
+```bash
+outfind find 10                 # ten more qualified leads — free, and cannot spend
+outfind find 10 --emails        # ...and buy an address for whatever cleared the gate
+outfind find 10 emails          # ten more *carrying* a verified email (≤10 credits)
+outfind find 0                  # no work at all — just print what is already there
+```
+
+Three things about `N` that are easy to get wrong:
+
+- **`N` is how many *more*, not a total.** A store with 30 leads answers `find 10` by working
+  until it has 40. Runs are fully resumable; re-running continues rather than restarting.
+- **`find 0` does no work and spends nothing.** It is how you re-export, or answer "what do we
+  have?" without running a job.
+- **`N` is a budget when the unit is `emails`.** The provider bills one credit per verified hit, so
+  `find 10 emails` is capped at ten credits by construction — the number typed is in the same unit
+  as the invoice.
+
+### What costs money
+
+Discovery and qualification are free (they cost only the user's own LLM key). **The address lookup
+is the only paid step**, and it is opt-in:
+
+- a bare `find N` **cannot** spend a credit, however many leads are queued past the confidence gate;
+- `--emails` permits buying for whatever is ready;
+- the `emails` unit implies `--emails`, because a goal counted in addresses cannot be met without
+  buying them.
+
+**Do not add `emails` or `--emails` unless the user asked for email addresses.** If they said
+"find me leads", run the free form and tell them the paid form exists. A lead with no address still
+exports — the row carries the person, the company and the reason with a blank `email`.
+
+### Other flags
+
+| Flag | What it does |
+|------|--------------|
+| `--new` | Print only the rows *this run* produced, instead of every lead in the store. Use this when you are reading stdout into your own context rather than into a file. |
+| `--json` | The rows as JSON Lines on stdout (the full record, `profile_text` included); the run's metadata — goal, outcome, `next_action` — as one JSON object on stderr, and nothing else there. Prefer it when you are going to parse. |
+| `--batch` | Hold everything until the job ends, then print every lead once — the old, pre-streaming shape. Output is progressive *by default* now (see below); reach for `--batch` only if whatever you are piping into cannot handle a stream — a strict single-document JSON parser, for instance. Not something you need for reading into your own context — that is what `--new` is for. |
+| `--debug` | Show the discovery walk's reasoning on stderr. For diagnosing a run that finds nothing. |
+| `--open` | Opens each new lead's profile in a browser. **Never pass this** — it is for a human at a terminal, and it errors out headless. |
+| `--db PATH` | Work against a SQLite file other than `~/.openoutfind/data/db.sqlite3` (same as `OPENOUTFIND_DB`). Accepted by every verb. |
+| `--agent-qualify` | Opt out of `AI_MODEL` for the qualify step — see *Answering qualify yourself* below. |
+| `--exclude PATH` | A file of LinkedIn URLs, one per line (blank lines ignored). Those profiles are never put up for a verdict — not even as a `qualify_pending` stop — never printed, and never counted toward the goal. URLs match with the host lowercased and the query, fragment and trailing slash dropped. An unreadable file is `bad_config`, before any work. |
+
+A run can take a while: each lead is an LLM call, and paid lookups are polled. Give it a generous
+timeout rather than a short one plus a retry — a killed run wastes the work, though nothing already
+qualified is lost.
+
+## Answering qualify yourself, with no second LLM key
+
+If you (the calling agent) are already reasoning about these leads in this conversation,
+`OPENOUTFIND_LLM_API_KEY` is a second, redundant LLM bill for a verdict you can write yourself. Add
+`--agent-qualify` and the run stops at the first candidate needing one instead of calling
+`AI_MODEL`:
+
+```bash
+outfind find 10 --agent-qualify --json
+```
+
+It runs discovery exactly as normal — free either way — and exits non-zero with `qualify_pending`,
+which carries the candidate's own fields right on the error object under `--json`
+(`{"error": {"type": "qualify_pending", "profile_text", "company", "job_title", "full_name",
+"profile_url", "lead_id", ...}}`; without `--json` the profile URL and text are narrated on stderr
+just above the one-line error). Judge the fit the
+same way you would judge anything else in this conversation, then re-run the **same command** with
+your verdict attached:
+
+```bash
+outfind find 10 --agent-qualify --verdict fit --reason "Series B security infra buyer, matches the ICP on team size and stack."
+outfind find 10 --agent-qualify --verdict no-fit --reason "Consumer app, not B2B — outside the target market."
+```
+
+This resumes from exactly that candidate — no lead id to track, since at most one is ever pending —
+records the verdict, and keeps going: either the goal is met, the search runs dry, or it stops
+again at the next `qualify_pending`. A rejected verdict disqualifies the lead the same way an
+LLM's "wrong fit" would; nothing already found is lost either way, same as `goal_unreached`.
+
+**`--verdict` needs both `--agent-qualify` and `--reason`** — passing one without the other is
+`bad_config`. **Don't pass `--agent-qualify` unless you intend to answer every `qualify_pending` it
+raises** — a bare `find` without the flag uses `AI_MODEL` and never stops for a verdict at all,
+which is the right default for a run nobody is driving turn-by-turn. **`--agent-qualify` also drops
+`OPENOUTFIND_AI_MODEL`/`OPENOUTFIND_LLM_API_KEY` out of what `find` requires** for that run — a run
+driven this way never needs a model key at all.
+
+**A fresh store asks you for its ICP first.** The cold start has two more model calls — the opening
+search keywords and a few invented ideal profiles — so the first `--agent-qualify` run on an empty
+store stops with `icp_pending` instead. Its error object carries `product_docs`, `campaign_target`,
+the allowed `seniorities`, `anchor_count` and the JSON `schema` of the answer. Write both parts in
+one object and re-run the same command with it:
+
+```bash
+outfind find 10 --agent-qualify --icp '{"seed": {"role_keywords": ["founder", "owner"],
+  "domain_keywords": ["clinic", "agency"], "seniority": "founder", "headcount_min": 1,
+  "headcount_max": 50}, "anchors": [{"profile": "founder of a dental clinic group ...",
+  "job_title": "founder", "location_country": "united states"}, ...]}'
+```
+
+Keywords are **single lowercase words**, never phrases — the search ANDs every word in one title, so
+`"head of growth"` finds nobody. An anchor's `profile` is one lowercase line shaped like a lead row
+(headline, industry, title, company, seniority, state, country). It is asked once per store; later
+runs never see it again.
+
+## Reading the output
+
+**stdout is result-only; logs, counts and progress go to stderr.** That is the contract that makes
+redirection correct:
+
+```bash
+outfind find 10 > leads.csv
+```
+
+**stdout carries every lead in the store, not just this run's rows.** The newest file supersedes every
+earlier one, and a lead whose address resolved since last time comes back with it filled in. It is
+one file to overwrite, never a batch per run — so never append, and never stitch runs together.
+Rows arrive progressively by default (what is already stored, immediately, then each new
+lead as it resolves) rather than all at once at the end — the total is the same either way, so this
+only matters if you are piping into something that cannot take a partial stream, in which case
+`--batch` restores the old wait-for-the-end behavior.
+
+Columns, in this order:
+
+```
+email, first_name, last_name, company, title, website, linkedin_url, reason, lead_id, qualified_at, full_name
+```
+
+- The names are **the importers'**, not OpenOutFind's: Instantly and Smartlead read
+  `email`/`first_name`/`last_name` and recognise `company`/`title`/`website`/`linkedin_url`, so the
+  file imports without column mapping. Everything else, `reason` included, arrives as a custom
+  variable. **Do not rename these columns** when handing the file on.
+- **`reason` is the point** — the LLM's written rationale for choosing this person. It is prose,
+  so it contains commas and quotes: parse with a real CSV reader (Python's `csv`, `pandas`), never
+  by splitting on `,`. When summarising leads for the user, quote the reason; that is what
+  distinguishes these rows from a list bought anywhere else.
+- **There is no score column, on purpose.** The model's confidence is a spend gate for the paid
+  lookup, not a quality signal — do not go looking for one, and do not synthesise one.
+- `lead_id` is the stable key for dedupe across exports. `qualified_at` is when the verdict landed.
+- **`first_name`/`last_name` are blank unless an address was bought** — they come from the paid
+  lookup's own response and are never split in-house. `full_name` is always there; use it when
+  naming a person to the user.
+- `company` and `website` are blank for placeholder employers ("Self employed", "Stealth
+  startup"), not a guessed firm.
+- Rejected leads never export: neither the LLM's "wrong fit" verdict nor a permanent
+  account-level opt-out.
+- **`reason` is written for the operator, not the prospect.** It justifies a yes/no —
+  third-person and evaluative. Never paste it into a message to the lead.
+
+**The CSV *is* the integration.** Instantly, Smartlead, Lemlist, HubSpot, a spreadsheet — the file
+imports as-is, and there is no adapter, webhook or plugin to look for. One thing to tell the
+operator when you hand a file on: **turn on their tool's import deduplication**. It is opt-in on
+Smartlead and undocumented on Instantly, so a re-exported lead can otherwise be contacted twice.
+
+**`find 0` is the re-emit path** — no work, no spend, prints what is already stored. That is
+what to run for *give me that file again*; there is no `export` verb and none is coming.
+
+### The JSON record
+
+For anything programmatic, prefer `--json` over parsing the CSV. It is **JSON Lines**: one record
+per line on stdout, carrying every CSV column plus `profile_text` — the raw firmographic text the
+qualifier judged on, which is what a sender writes a message from. The run's own metadata is one
+JSON object on stderr:
+
+```bash
+outfind find 10 --json > leads.jsonl 2> run.json
+outfind find 10 --json | jq -r '.email'          # the records
+```
+
+One record, two serialisations: the JSON is the whole thing, the CSV is the importer-safe
+projection of it. A reader **ignores keys it does not know** — the finder never renames a key or
+repurposes one, and only ever adds.
+
+## Exit codes and failures
+
+**Exit 0 means the goal was met, and nothing else.** Anything short still prints its rows and exits
+non-zero with a single line on stderr:
+
+```
+error: <type>: <message>
+```
+
+Under `--json` that becomes `{"error": {"type": ..., "message": ...}}`, still on stderr. The `type`
+is a stable string worth branching on:
+
+| type | What it means | What to do |
+|------|---------------|-----------|
+| `goal_unreached` | Ran, produced fewer than asked. The rows are on stdout. | Read the message: a drained index is a dead end, addresses on order are a reason to run again later. |
+| `not_initialized` | No pipeline at this database yet. | `outfind check` |
+| `onboarding_incomplete` | The run was not given everything it needs. | The message names every missing variable; `outfind status` does too. |
+| `no_credential` | No BetterContact key. | Configure one; discovery needs it too, and the free tier has 40 credits. |
+| `provider_auth` | The key was rejected. | Do not retry; the key is wrong. |
+| `provider_out_of_credits` | Credits exhausted. | Free `find N` still works; addresses do not. |
+| `provider_rate_limited` | 429. | Back off. **Never retry at speed** — the provider's docs say that can block the account. |
+| `provider_unavailable` | Provider unreachable at all. | Transient; retry later. |
+| `bad_config` | A value is set but unusable (e.g. a negative count). | Read the message; it names the field. |
+| `qualify_pending` | `--agent-qualify` stopped one candidate short of the `AI_MODEL` call it opted out of. | Judge the candidate carried on the error object, then re-run with `--verdict`/`--reason` — see *Answering qualify yourself*. |
+| `icp_pending` | `--agent-qualify` on a fresh store: the opening keywords and ideal profiles are needed first. | Write them from the error's `product_docs`/`campaign_target` in its `schema`, then re-run with `--icp '<json>'`. |
+
+Treat a non-zero exit as *partial success with a stated reason*, not as "nothing happened" — the
+rows are already on stdout. And never report a failed run to the user as "no leads matched": a
+throttled or unauthorised run that reads as an empty result is the worst possible answer, which is
+why every failure carries a type.
+
+## Handing the leads on
+
+The export is a one-way boundary: leads leave, nothing comes back. There is no inbound endpoint and
+no callback. Whoever sends owns the conversation, the suppression list and the opt-out duty.
+
+So the natural next step after a run is another tool's importer — Instantly, Smartlead, Lemlist, a
+CRM, a spreadsheet, or [OpenOutSend](https://github.com/eracle/OpenOutSend) for the
+sending half. **Tell the user to switch on their sequencer's import deduplication**: it is opt-in on
+Smartlead and undocumented on Instantly, so a lead exported twice can otherwise be contacted twice.
+
+## Things not to do
+
+- Don't invent a daemon, a `run` verb, a scheduler, or a watch loop. `find` is the whole of it.
+- Don't go looking for an output file. There isn't one unless the user redirected stdout.
+- Don't spend credits the user didn't ask for (see *What costs money*).
+- Don't parse stderr for data, or expect data on stdout to be anything but the result.
