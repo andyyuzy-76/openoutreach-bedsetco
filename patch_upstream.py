@@ -1,4 +1,4 @@
-"""Apply BedSetCo source policy changes; upstream licences remain intact."""
+"""Apply local workbench source changes; upstream licences remain intact."""
 import ast
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent/'src'
@@ -30,12 +30,12 @@ guard(ROOT/'OpenOutreach/openoutreach/wizard.py',{
     'apply_to_environment':'    config.newsletter = False\n    os.environ["OPENOUTFIND_NEWSLETTER"] = "false"',
     '_write_back_from_environment':'    config.newsletter = False\n    os.environ["OPENOUTFIND_NEWSLETTER"] = "false"'})
 guard(ROOT/'OpenOutreach/openoutreach/__main__.py',{
-    '_send':'    raise SystemExit("BedSetCo: use the local reviewed queue (bedsetco.py).")',
-    '_run':'    raise SystemExit("BedSetCo: automatic find-and-send is disabled. Use the local workbench.")'})
+    '_send':'    raise SystemExit("Use the local reviewed queue (outreach.py) with your own mail settings.")',
+    '_run':'    raise SystemExit("Use the local workbench (outreach.py) to collect, review and send.")'})
 guard(ROOT/'OpenOutSend/cold_outreach/emails/sender.py',{
     '_attribute':'    return body.rstrip() + "\\n"',
-    '_deliver':'    raise RuntimeError("BedSetCo: send only through the reviewed local queue.")'})
-print('BedSetCo source policies applied.')
+    '_deliver':'    raise RuntimeError("Send through the reviewed local queue with your configured mail server.")'})
+print('Local workbench source changes applied.')
 
 # pydantic-ai 2 uses OpenAIChatModel; upstream still imports the removed alias.
 for path in (ROOT/'OpenOutFind/openoutfind/core/llm.py', ROOT/'OpenOutSend/cold_outreach/core/llm.py'):

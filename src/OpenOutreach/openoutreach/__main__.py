@@ -203,7 +203,7 @@ def _send(rest: list[str]) -> int:
     `DJANGO_SETTINGS_MODULE` is set with `setdefault` and `django.setup()` is idempotent.
     """
     # BedSetCo policy: local contacts, no central hub or autonomous mail.
-    raise SystemExit("BedSetCo: use the local reviewed queue (bedsetco.py).")
+    raise SystemExit("Use the local reviewed queue (outreach.py) with your own mail settings.")
     from cold_outreach.__main__ import main as outsend_main
 
     return outsend_main(["send", *rest])
@@ -219,7 +219,7 @@ def _run(rest: list[str]) -> int:
     hand-off would be a second, untested path between the same two programs.
     """
     # BedSetCo policy: local contacts, no central hub or autonomous mail.
-    raise SystemExit("BedSetCo: automatic find-and-send is disabled. Use the local workbench.")
+    raise SystemExit("Use the local workbench (outreach.py) to collect, review and send.")
     from django.core.management import call_command
 
     from cold_outreach.leads.ingest import ingest

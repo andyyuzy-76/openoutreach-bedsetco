@@ -13,11 +13,12 @@ import threading
 import time
 from urllib.parse import urlparse
 import uuid
+import mail_transport
+import private_store
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
 FILE = DATA / 'business-profiles.json'
-SENDER = 'sales@bedsetco.com'
 LEGACY_ID = 'bedsetco-bedding'
 LOCK = threading.RLock()
 VARIABLES = ('company', 'name', 'brand', 'category', 'product_intro', 'sender_name',
@@ -51,7 +52,7 @@ TEMPLATES = {
 @contextmanager
 def locked():
     """Serialize profile writes across the UI and separate daily processes."""
-    DATA.mkdir(exist_ok=True)
+    private_store.prepare()
     with LOCK, (DATA / 'business-profiles.lock').open('a+b') as handle:
         handle.seek(0, 2)
         if handle.tell() == 0:
@@ -117,7 +118,9 @@ def _write(state):
 
 def _read(legacy_config=None):
     if not FILE.exists():
-        if (DATA / 'queue.sqlite3').exists() or (DATA / 'finder.dpapi').exists():
+        # Only an explicitly configured old deployment is migrated as BedSetCo.
+        # A fresh queue or an AI key does not establish the user's industry.
+        if mail_transport.legacy_ops():
             if legacy_config is None:
                 from finder import credentials
                 legacy_config = credentials()
@@ -288,11 +291,13 @@ def reset_templates(profile_id, revision):
     return '已按保存的邮件语言恢复通用品类模板。'
 
 
-def render(profile, company, name=''):
+def render(profile, company, name='', sender_email=None):
     require_ready(profile)
     values = {k: profile.get(k, '') for k in VARIABLES}
     values.update(company=company, name=name or ('there' if profile['language'] == 'en' else '采购负责人'),
-                  sender_email=SENDER, target_market=profile['target_markets'].replace('\n', ', '))
+                  sender_email=(mail_transport.sender_email() if sender_email is None else sender_email)
+                               or '[请先配置发件邮箱]',
+                  target_market=profile['target_markets'].replace('\n', ', '))
     subject = profile['subject_template'].format_map(values).strip()
     body = profile['body_template'].format_map(values).strip()
     if not subject or '\n' in subject or '\r' in subject or not body or len(body) > 30000:

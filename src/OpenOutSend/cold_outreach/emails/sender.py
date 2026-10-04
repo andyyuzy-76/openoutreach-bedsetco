@@ -283,7 +283,7 @@ def _deliver(mailbox, email_message: EmailMessage, row) -> None:
     retried; what changes is that the receiver's word survives the traceback.
     """
     # BedSetCo policy: local contacts, no central hub or autonomous mail.
-    raise RuntimeError("BedSetCo: send only through the reviewed local queue.")
+    raise RuntimeError("Send through the reviewed local queue with your configured mail server.")
     from cold_outreach.emails.delivery_policy import record_acceptance, record_failure
 
     try:

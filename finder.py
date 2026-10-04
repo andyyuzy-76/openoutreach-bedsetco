@@ -1,6 +1,4 @@
-"""Free public website finder; optional AI credentials use Windows DPAPI."""
-import ctypes
-from ctypes import wintypes
+"""Free public website finder with optional, locally stored AI credentials."""
 import csv
 import io
 import json
@@ -9,38 +7,18 @@ from pathlib import Path
 import subprocess
 import threading
 import business_profiles as businesses
+import mail_transport
+import private_store
+from private_store import protect  # Compatibility for existing local migration helpers.
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'
 JOB={'running':False,'notice':'免费官网邮箱采集已就绪，填写搜索词或公司网址后开始。'}
 LOCK=threading.Lock()
 
-class Blob(ctypes.Structure):
-    _fields_=[('size',wintypes.DWORD),('data',ctypes.POINTER(ctypes.c_ubyte))]
-
-def protect(raw,decode=False):
-    buffer=ctypes.create_string_buffer(raw)
-    incoming=Blob(len(raw),ctypes.cast(buffer,ctypes.POINTER(ctypes.c_ubyte)))
-    output=Blob()
-    fn=ctypes.windll.crypt32.CryptUnprotectData if decode else ctypes.windll.crypt32.CryptProtectData
-    fn.argtypes=[ctypes.POINTER(Blob),ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(Blob)]
-    fn.restype=wintypes.BOOL
-    if not fn(ctypes.byref(incoming),None,None,None,None,1,ctypes.byref(output)):
-        raise OSError('Windows 加密配置失败')
-    try:
-        return ctypes.string_at(output.data,output.size)
-    finally:
-        free=ctypes.windll.kernel32.LocalFree
-        free.argtypes=[ctypes.c_void_p];free.restype=ctypes.c_void_p
-        free(output.data)
-
 def credentials():
-    path=DATA/'finder.dpapi'
-    if path.exists():
-        config=json.loads(protect(path.read_bytes(),True))
-        return config
-    return {'model':'openai_compatible:YOUR_MODEL','base':'https://api.orendaedu.cn/v1',
-            'llm_key':'','bettercontact_key':''}
+    return private_store.load('finder', {'model':'openai_compatible:YOUR_MODEL',
+            'base':'https://api.openai.com/v1','llm_key':'','bettercontact_key':''})
 
 def settings(profile=None):
     config=credentials()
@@ -65,11 +43,8 @@ def save(values):
             raise ValueError('AI 接口地址须为 https://')
         if ':' not in config['model']:
             raise ValueError('模型格式应为 openai_compatible:模型名称')
-        DATA.mkdir(exist_ok=True)
-        temp=DATA/'finder.dpapi.tmp'
-        temp.write_bytes(protect(json.dumps(config).encode()))
-        temp.replace(DATA/'finder.dpapi')
-    return '配置已保存；密钥使用当前 Windows 用户加密，页面不回显。'
+        private_store.save('finder',config)
+    return '配置已保存在本机私有数据目录；密钥不在页面回显。'
 
 def environment(config,profile=None):
     profile=businesses.require_ready(profile or businesses.get(config.get('profile_id')))
@@ -80,7 +55,7 @@ def environment(config,profile=None):
         'OPENOUTFIND_AI_MODEL':config['model'],'OPENOUTFIND_LLM_API_BASE':config['base'],
         'OPENOUTFIND_LLM_API_KEY':config['llm_key'],
         'OPENOUTFIND_BETTERCONTACT_API_KEY':'',
-        'OPENOUTFIND_OPERATOR_EMAIL':'sales@bedsetco.com','OPENOUTFIND_OPERATOR_COUNTRY':'CN',
+        'OPENOUTFIND_OPERATOR_EMAIL':mail_transport.sender_email(),'OPENOUTFIND_OPERATOR_COUNTRY':'',
         'OPENOUTFIND_CONTACTS_API_TOKEN':'','OPENOUTFIND_NEWSLETTER':'false',
         'OPENOUTFIND_PRODUCT_DOCS':businesses.product_docs(profile),
         'OPENOUTFIND_CAMPAIGN_TARGET':businesses.target_docs(profile)})

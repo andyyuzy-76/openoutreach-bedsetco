@@ -2,6 +2,7 @@
 /data/
 /config.private.json
 **/config.private.json
+*.private.json
 .venv/
 __pycache__/
 *.py[cod]

@@ -1,4 +1,4 @@
-"""Multi-category outreach queue with shared accounting and restricted transport."""
+"""Multi-category outreach queue with user-configured SMTP and shared accounting."""
 from __future__ import annotations
 import argparse
 import csv
@@ -9,13 +9,14 @@ import json
 import re
 import secrets
 import os
-import shutil
 import sqlite3
-import subprocess
 import threading
 import finder
 import business_profiles as businesses
 from profile_ui import editor as business_editor
+import mail_transport as mail
+import private_store
+from mail_ui import editor as mail_editor
 import webbrowser
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -27,17 +28,14 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 ROOT = Path(__file__).resolve().parent
-OPS = ROOT / 'ops'
 DATA = ROOT / 'data'
-SENDER = 'sales@bedsetco.com'
 TOKEN = secrets.token_urlsafe(32)
-LIMIT = 3
 LABELS = {'draft':'待审核','approved':'已审核','submitting':'提交中／需核查',
           'accepted':'服务器已接收（待投递核查）','uncertain':'结果不明，禁止重发',
-          'suppressed':'已停用','delivered':'对方服务器已接收'}
+          'rejected':'服务器拒绝提交（未自动重试）','suppressed':'已停用','delivered':'对方服务器已接收'}
 
 def db():
-    DATA.mkdir(exist_ok=True)
+    private_store.prepare()
     c = sqlite3.connect(DATA / 'queue.sqlite3', timeout=20)
     c.row_factory = sqlite3.Row
     c.executescript('''CREATE TABLE IF NOT EXISTS leads (
@@ -51,15 +49,29 @@ def db():
     if not {'profile_id','profile_name','profile_snapshot'}.issubset(columns):
         c.execute('BEGIN IMMEDIATE')
         columns={r['name'] for r in c.execute('PRAGMA table_info(leads)')}
-        for name,definition in (('profile_id',"TEXT NOT NULL DEFAULT 'bedsetco-bedding'"),
-                                ('profile_name',"TEXT NOT NULL DEFAULT 'BedSetCo 床品'"),
+        for name,definition in (('profile_id',"TEXT NOT NULL DEFAULT ''"),
+                                ('profile_name',"TEXT NOT NULL DEFAULT ''"),
                                 ('profile_snapshot',"TEXT NOT NULL DEFAULT ''")):
             if name not in columns:
                 c.execute(f'ALTER TABLE leads ADD COLUMN {name} {definition}')
-        snapshot=json.dumps(businesses.legacy_snapshot(),ensure_ascii=False,sort_keys=True)
-        c.execute("UPDATE leads SET profile_snapshot=? WHERE profile_snapshot=''",(snapshot,))
+        profile=businesses.legacy_snapshot() if mail.legacy_ops() else businesses.get()
+        snapshot=json.dumps(profile,ensure_ascii=False,sort_keys=True)
+        c.execute("UPDATE leads SET profile_id=?,profile_name=?,profile_snapshot=? WHERE profile_snapshot=''",
+                  (profile['id'],profile['name'],snapshot))
         # Include the frozen business identity in new approvals. Re-review old approvals.
         c.execute("UPDATE leads SET status='draft',approval=NULL WHERE status='approved'")
+        c.commit()
+    columns={r['name'] for r in c.execute('PRAGMA table_info(leads)')}
+    if 'mail_snapshot' not in columns:
+        c.execute('BEGIN IMMEDIATE')
+        if 'mail_snapshot' not in {r['name'] for r in c.execute('PRAGMA table_info(leads)')}:
+            c.execute("ALTER TABLE leads ADD COLUMN mail_snapshot TEXT NOT NULL DEFAULT ''")
+            # Historical messages keep their From identity. Only the old explicit adapter
+            # may be bound automatically, because its configured sender is unchanged.
+            if mail.settings()['driver']=='restricted':
+                frozen=json.dumps(mail.snapshot(),ensure_ascii=False,sort_keys=True)
+                c.execute("UPDATE leads SET mail_snapshot=? WHERE mail_snapshot=''",(frozen,))
+            c.execute("UPDATE leads SET status='draft',approval=NULL WHERE status='approved'")
         c.commit()
     return c
 
@@ -68,7 +80,7 @@ def event(c, row_id, action, detail=''):
               (datetime.now().astimezone().isoformat(), row_id, action, detail))
 
 def digest(row):
-    return hashlib.sha256(json.dumps([row['email'],row['subject'],row['body'],row['profile_snapshot']],
+    return hashlib.sha256(json.dumps([row['email'],row['subject'],row['body'],row['profile_snapshot'],row['mail_snapshot']],
                          ensure_ascii=False).encode()).hexdigest()
 
 def lead_business(row):
@@ -85,30 +97,36 @@ def automated_business(row):
     return frozen
 
 def address(value):
-    value = value.strip().lower()
-    if not re.fullmatch(r'[a-z0-9.!#$%&\x27*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}', value):
-        raise ValueError('邮箱格式不正确，请只填一个邮箱地址')
-    if value.endswith('@bedsetco.com'):
+    value = mail.email(value)
+    sender=mail.sender_email()
+    if sender and value.rsplit('@',1)[-1]==sender.rsplit('@',1)[-1]:
         raise ValueError('此队列仅用于外部联系人')
     return value
 
 def history_blocks():
-    """Read existing suppression plus server audit exports afresh before every send."""
+    """Use this installation's history; optionally include an old deployment's history."""
     blocked = set()
-    p = OPS / 'importyeti-gmail-suppression-ledger.json'
-    if not p.exists():
-        raise ValueError('找不到现有客户去重台账，暂停导入和发送')
-    data = json.loads(p.read_text(encoding='utf-8-sig'))
-    blocked.update(d.lower() for d in data['suppressed_domains'])
-    blocked.update(e.lower().split('@')[-1] for e in data['suppressed_emails'])
-    ledger=OPS/'importyeti-submission-ledger.jsonl'
+    ops=mail.legacy_ops()
+    suppression=[DATA/'suppression-ledger.json']
+    if ops:
+        p=ops/'importyeti-gmail-suppression-ledger.json'
+        if not p.exists():
+            raise ValueError('已有部署的客户去重台账缺失，请恢复完整历史')
+        suppression.append(p)
+    for p in suppression:
+        if not p.exists():continue
+        data=json.loads(p.read_text(encoding='utf-8-sig'))
+        blocked.update(d.lower() for d in data['suppressed_domains'])
+        blocked.update(e.lower().split('@')[-1] for e in data['suppressed_emails'])
+    ledger=mail.ledger_path()
     if ledger.exists():
         for line in ledger.read_text(encoding='utf-8-sig').splitlines():
             if not line.strip():continue
             item=json.loads(line)
             blocked.update(d.lower() for d in item.get('domains',[]) if d)
             if item.get('recipient'):blocked.add(item['recipient'].lower().split('@')[-1])
-    for p in list(OPS.glob('importyeti*outreach*audit*.json')) + list(DATA.glob('server-history.json')):
+    audits=(list(ops.glob('importyeti*outreach*audit*.json')) if ops else [])+list(DATA.glob('server-history.json'))
+    for p in audits:
         data = json.loads(p.read_text(encoding='utf-8-sig'))
         for line in data.get('lines', []) + data.get('external_accept_lines', []):
             for email in re.findall(r'to=<([^>]+)>',line):
@@ -116,7 +134,7 @@ def history_blocks():
     return blocked
 
 def ledger_append(item):
-    with (OPS/'importyeti-submission-ledger.jsonl').open('a',encoding='utf-8') as out:
+    with mail.ledger_path().open('a',encoding='utf-8') as out:
         out.write(json.dumps(item,ensure_ascii=False)+'\n')
         out.flush()
         os.fsync(out.fileno())
@@ -124,7 +142,7 @@ def ledger_append(item):
 def shared_submissions_today(c):
     today=datetime.now().astimezone().date()
     message_ids=set()
-    ledger=OPS/'importyeti-submission-ledger.jsonl'
+    ledger=mail.ledger_path()
     if ledger.exists():
         for line in ledger.read_text(encoding='utf-8-sig').splitlines():
             if not line.strip():continue
@@ -146,12 +164,18 @@ def blocked_reason(c, row):
     if any(domain == b[0] or domain.endswith('.'+b[0]) or b[0].endswith('.'+domain)
            for b in c.execute('SELECT domain FROM blocks')):
         return '此公司已停用'
-    if c.execute("SELECT 1 FROM leads WHERE domain=? AND id<>? AND status IN ('submitting','accepted','uncertain','delivered')",(domain,row['id'])).fetchone():
+    if c.execute("SELECT 1 FROM leads WHERE domain=? AND id<>? AND submitted_at IS NOT NULL",(domain,row['id'])).fetchone():
         return '此公司已有提交记录，不再发送首封开发信'
     return ''
 
 def import_csv(text,profile=None):
+    with mail.locked('mail'):
+        return _import_csv(text,profile)
+
+
+def _import_csv(text,profile=None):
     profile=businesses.require_ready(profile or businesses.get())
+    account=mail.snapshot()
     reader = csv.DictReader(io.StringIO(text.lstrip('\ufeff')))
     if not reader.fieldnames or not {'email','company'}.issubset(reader.fieldnames):
         raise ValueError('CSV 必须包含 email、company 列；可选 name、subject、body')
@@ -171,7 +195,7 @@ def import_csv(text,profile=None):
             name = (row.get('name') or '').strip()
             if not company or '\n' in company or '\r' in company:
                 raise ValueError('公司名称不能为空或包含换行')
-            default_subject,default_body=businesses.render(selected,company,name)
+            default_subject,default_body=businesses.render(selected,company,name,sender_email=account['sender_email'])
             subject = (row.get('subject') or '').strip() or default_subject
             body = (row.get('body') or '').strip() or default_body
             if '\n' in subject or '\r' in subject or len(body)>30000:
@@ -180,9 +204,10 @@ def import_csv(text,profile=None):
             if any(domain==d or domain.endswith('.'+d) or d.endswith('.'+domain) for d in historical|existing):
                 skipped += 1
                 continue
-            cur = c.execute('INSERT OR IGNORE INTO leads (email,company,domain,name,subject,body,profile_id,profile_name,profile_snapshot) VALUES (?,?,?,?,?,?,?,?,?)',
+            cur = c.execute('INSERT OR IGNORE INTO leads (email,company,domain,name,subject,body,profile_id,profile_name,profile_snapshot,mail_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?)',
                             (email,company,domain,name,subject,body,selected['id'],selected['name'],
-                             json.dumps(selected,ensure_ascii=False,sort_keys=True)))
+                             json.dumps(selected,ensure_ascii=False,sort_keys=True),
+                             json.dumps(account,ensure_ascii=False,sort_keys=True)))
             existing.add(domain)
             count += cur.rowcount
             skipped += not cur.rowcount
@@ -199,20 +224,66 @@ def update(row_id, values):
         c.execute("UPDATE leads SET subject=?,body=?,status='draft',approval=NULL WHERE id=?",(subject,body,row_id))
         event(c,row_id,'edit')
 
+def bound_account(row, config):
+    frozen=json.loads(row['mail_snapshot'] or '{}')
+    if frozen.get('fingerprint')!=mail.snapshot(config)['fingerprint']:
+        raise ValueError('发件配置已变更或尚未绑定。请先按当前邮件配置重建草稿，再审核')
+    return frozen
+
+
+def rebuild(row_id):
+    """Explicitly regenerate only an unsent draft, keeping its original business facts."""
+    with mail.locked('mail'), db() as c:
+        config=mail.require_ready()
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
+        if not row or row['status'] not in ('draft','approved') or row['submitted_at']:
+            raise ValueError('只能重建从未提交过的草稿')
+        subject,body=businesses.render(lead_business(row),row['company'],row['name'],sender_email=config['sender_email'])
+        c.execute("UPDATE leads SET subject=?,body=?,mail_snapshot=?,status='draft',approval=NULL WHERE id=?",
+                  (subject,body,json.dumps(mail.snapshot(config),ensure_ascii=False,sort_keys=True),row_id))
+        event(c,row_id,'rebuild_mail','current account; original business profile')
+    return '已按原业务模板和当前邮件配置重建草稿，请核对正文后重新审核。'
+
+
 def approve(row_id, *, automated=False):
-    with db() as c:
+    with mail.locked('mail'), db() as c:
+        config=mail.require_ready()
+        c.execute('BEGIN IMMEDIATE')
         row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
         if not row or row['status']!='draft':
             raise ValueError('仅可审核待审核草稿')
         if automated:
             automated_business(row)
+        bound_account(row,config)
+        address(row['email'])
         if reason := blocked_reason(c,row):
             raise ValueError(reason)
         c.execute("UPDATE leads SET status='approved',approval=? WHERE id=?",(digest(row),row_id))
         event(c,row_id,'approve',digest(row))
 
+def import_blocks(text):
+    domains=set()
+    for line in text.splitlines():
+        value=line.strip().lower()
+        if not value:continue
+        domain=mail.email(value if '@' in value else 'check@'+value).rsplit('@',1)[-1]
+        domains.add(domain)
+    if not domains or len(domains)>1000:
+        raise ValueError('请每行填写一个已联系／退订公司域名或邮箱，单次最多 1000 家')
+    with mail.locked('mail'), db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        for domain in sorted(domains):
+            c.execute('INSERT OR REPLACE INTO blocks VALUES (?,?)',(domain,'导入已有联系／退订记录'))
+            c.execute("UPDATE leads SET status='suppressed',approval=NULL WHERE (domain=? OR domain LIKE ?) AND status IN ('draft','approved')",
+                      (domain,'%.'+domain))
+            ledger_append({'event':'company_suppressed','timestamp':datetime.now().astimezone().isoformat(),
+                           'domains':[domain],'reason':'导入已有联系／退订记录','action':'禁止再联系'})
+        event(c,0,'import_blocks',str(len(domains)))
+    return f'已记录 {len(domains)} 家公司的停用域名，所有业务共用。'
+
 def suppress(row_id):
-    with db() as c:
+    with mail.locked('mail'), db() as c:
         row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
         if not row:
             raise ValueError('联系人不存在')
@@ -224,81 +295,75 @@ def suppress(row_id):
             'reason':'用户停用／退订','action':'禁止再联系'})
 
 def send(row_id, *, automated=False):
-    if (DATA / 'sender-migration-pending.json').exists():
-        raise ValueError('sales@bedsetco.com 发件切换待服务器规则同步，当前暂停发送。')
-    script = OPS / 'importyeti-mail-send.ps1'
-    pwsh = shutil.which('pwsh')
-    if not script.exists() or not pwsh:
-        raise ValueError('缺少现有受限发信脚本或 PowerShell 7')
-    # Refresh live server history so the existing daily mail flow is also considered.
-    history=subprocess.run([pwsh,'-NoProfile','-NonInteractive','-File',
-        str(OPS/'importyeti-mail-audit.ps1'),'-Operation','recent_outbound'],
-        capture_output=True,text=True,encoding='utf-8',timeout=35,
-        creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    if history.returncode:
-        raise ValueError('无法读取服务器发信记录，暂停发送以免重复联系')
-    report=json.loads(history.stdout.lstrip('\ufeff'))
-    if not report.get('ok') or 'lines' not in report:
-        raise ValueError('服务器发信记录格式异常，暂停发送')
-    (DATA/'server-history.json').write_text(json.dumps(report,ensure_ascii=False),encoding='utf-8')
-    with db() as c:
-        c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
-        if not row or row['status']!='approved' or row['approval']!=digest(row):
-            raise ValueError('须先审核当前版本；已提交的邮件不能重发')
-        if automated:
-            automated_business(row)
-        if reason := blocked_reason(c,row):
-            raise ValueError(reason)
-        n = shared_submissions_today(c)
-        if n >= LIMIT:
-            raise ValueError(f'每日合计提交上限为 {LIMIT} 封，今天已用完')
-        last=c.execute('SELECT max(submitted_at) FROM leads').fetchone()[0]
-        if last and datetime.now().astimezone()-datetime.fromisoformat(last)<timedelta(minutes=4):
-            raise ValueError('两封新邮件至少间隔 4 分钟，请稍后发送')
-        message = EmailMessage(policy=SMTP)
-        profile=lead_business(row)
-        message['From'] = Address(display_name=profile.get('sender_name') or profile['brand'],addr_spec=SENDER)
-        message['Reply-To'] = SENDER
-        message['To'] = row['email']
-        message['Subject'] = row['subject']
-        message['Date'] = format_datetime(datetime.now().astimezone())
-        message['Message-ID'] = make_msgid(domain='bedsetco.com')
-        message['List-Unsubscribe'] = f'<mailto:{SENDER}?subject=unsubscribe>'
-        body = row['body']
-        if 'unsubscribe' not in body.lower():
-            raise ValueError('正文须保留回复 unsubscribe 的退订说明；补充后重新审核')
-        message.set_content(body)
-        raw = message.as_bytes()
-        if len(raw)>65536:
-            raise ValueError('邮件超过现有服务器单封大小上限')
-        out = DATA / 'messages'
-        out.mkdir(exist_ok=True)
-        eml = out / f'{row_id}.eml'
-        eml.write_bytes(raw)
-        c.execute("UPDATE leads SET status='submitting',message_id=?,submitted_at=? WHERE id=?",(message['Message-ID'],datetime.now().astimezone().isoformat(),row_id))
-        event(c,row_id,'submit',message['Message-ID'])
-        ledger_append({'event':'submission_started','timestamp':datetime.now().astimezone().isoformat(),
-            'company':row['company'],'domains':[row['domain']],'recipient':row['email'],
-            'from':SENDER,'message_id':message['Message-ID'],'message_path':str(eml),
-            'profile_id':row['profile_id'],'profile_name':row['profile_name'],
-            'category':profile['category'],'profile_revision':profile['revision'],
-            'channel':'restricted-self-hosted-wrapper','action':'未发/待验收'})
-    # State is persisted before transport; crash/timeout must never cause an automatic retry.
-    state,note = 'uncertain','提交结果不明，请按 Message-ID 查询服务器记录，勿重发。'
-    try:
-        result = subprocess.run([pwsh,'-NoLogo','-NoProfile','-NonInteractive','-File',str(script),
-            '-MessagePath',str(eml),'-ExpectedRecipient',row['email']],capture_output=True,text=True,
-            encoding='utf-8',timeout=50,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        if result.returncode==0:
-            ack = json.loads(result.stdout.lstrip('\ufeff'))
-            if ack.get('wrapper_accepted') is True and ack.get('recipient')==row['email'] and ack.get('message_id')==message['Message-ID']:
-                state,note = 'accepted','服务器已接收；对方服务器的最终投递状态尚未核查。'
-    except (subprocess.TimeoutExpired,OSError,ValueError):
-        pass
-    with db() as c:
-        c.execute('UPDATE leads SET status=?,note=? WHERE id=?',(state,note,row_id))
-        event(c,row_id,state,note)
+    with mail.locked('mail'):
+        config=mail.require_ready()
+        mail.refresh_history(config)
+        with db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row=c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
+            if not row or row['status']!='approved' or row['approval']!=digest(row) or row['submitted_at']:
+                raise ValueError('须先审核当前版本；已提交的邮件不能重发')
+            bound_account(row,config)
+            address(row['email'])
+            if automated:
+                automated_business(row)
+            if reason:=blocked_reason(c,row):
+                raise ValueError(reason)
+            limit=config['daily_limit']
+            if shared_submissions_today(c)>=limit:
+                raise ValueError(f'每日合计提交上限为 {limit} 封，今天已用完')
+            last=c.execute('SELECT max(submitted_at) FROM leads').fetchone()[0]
+            stamps=[datetime.fromisoformat(last)] if last else []
+            ledger=mail.ledger_path()
+            if ledger.exists():
+                for line in ledger.read_text(encoding='utf-8-sig').splitlines():
+                    if not line.strip():continue
+                    item=json.loads(line)
+                    if item.get('event')=='submission_started':
+                        stamps.append(datetime.fromisoformat(item['timestamp']))
+            if stamps and datetime.now().astimezone()-max(stamps)<timedelta(seconds=config['interval_seconds']):
+                raise ValueError(f'两次提交至少间隔 {config["interval_seconds"]} 秒，请稍后发送')
+            profile=lead_business(row)
+            sender=config['sender_email']
+            message=EmailMessage(policy=SMTP)
+            message['From']=Address(display_name=config['display_name'] or profile.get('sender_name') or profile['brand'],addr_spec=sender)
+            message['Reply-To']=config['reply_to']
+            message['To']=row['email']
+            message['Subject']=row['subject']
+            message['Date']=format_datetime(datetime.now().astimezone())
+            message['Message-ID']=make_msgid(domain=sender.rsplit('@',1)[-1])
+            message['List-Unsubscribe']=f'<mailto:{config["reply_to"]}?subject=unsubscribe>'
+            if 'unsubscribe' not in row['body'].lower():
+                raise ValueError('正文须保留回复 unsubscribe 的退订说明；补充后重新审核')
+            if '[请先配置发件邮箱]' in row['body']:
+                raise ValueError('草稿仍含未配置的发件邮箱，请重建并重新审核')
+            message.set_content(row['body'])
+            raw=message.as_bytes()
+            if config['driver']=='restricted' and len(raw)>65536:
+                raise ValueError('邮件超过当前旧接入的单封大小上限')
+            out=DATA/'messages'
+            out.mkdir(exist_ok=True)
+            eml=out/f'{row_id}.eml'
+            eml.write_bytes(raw)
+            stamp=datetime.now().astimezone().isoformat()
+            c.execute("UPDATE leads SET status='submitting',message_id=?,submitted_at=? WHERE id=?",(message['Message-ID'],stamp,row_id))
+            event(c,row_id,'submit',message['Message-ID'])
+            ledger_append({'event':'submission_started','timestamp':stamp,'company':row['company'],
+                'domains':[row['domain']],'recipient':row['email'],'from':sender,
+                'message_id':message['Message-ID'],'message_path':str(eml),
+                'profile_id':row['profile_id'],'profile_name':row['profile_name'],
+                'category':profile['category'],'profile_revision':profile['revision'],
+                'channel':config['driver'],'action':'未发/待验收'})
+        # Both the message and an irreversible submission state exist before contacting
+        # the server. Configuration is locked until this one attempt has completed.
+        state,note=mail.submit(config,eml,row['email'],message['Message-ID'])
+        receipt={'at':datetime.now().astimezone().isoformat(),'state':state,'note':note,
+                 'message_id':message['Message-ID'],'recipient':row['email'],
+                 'sender':sender,'transport':config['driver'],'final_delivery_confirmed':False}
+        (DATA/f'receipt-{row_id}.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2),encoding='utf-8')
+        with db() as c:
+            c.execute('UPDATE leads SET status=?,note=? WHERE id=?',(state,note,row_id))
+            event(c,row_id,state,note)
     return note
 
 def audit(row_id):
@@ -306,13 +371,10 @@ def audit(row_id):
         row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
     if not row or not row['message_id']:
         raise ValueError('此联系人尚无提交记录')
-    result = subprocess.run([shutil.which('pwsh') or 'pwsh','-NoProfile','-NonInteractive','-File',
-        str(OPS/'importyeti-mail-audit.ps1'),'-Operation','lookup','-Needle',row['message_id']],
-        capture_output=True,text=True,encoding='utf-8',timeout=35,
-        creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    if result.returncode:
-        raise ValueError('服务器核查失败，请稍后再查；不要重发')
-    report = json.loads(result.stdout.lstrip('\ufeff'))
+    account=json.loads(row['mail_snapshot'] or '{}')
+    if account.get('driver')!='restricted':
+        return f'{row["note"] or LABELS[row["status"]]} 原 Message-ID：{row["message_id"]}。请在自己的邮箱查看退信或查询服务器投递日志；本地记录不证明最终投递。'
+    report=mail.audit_legacy(account,row['message_id'])
     (DATA/f'audit-{row_id}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     delivered = report.get('failure_seen') is False and any(f"to=<{row['email']}>" in line and 'status=sent' in line
                     and re.search(r'\(250[ -]',line) and 'relay=127.0.0.1' not in line
@@ -324,8 +386,11 @@ def audit(row_id):
     return '对方邮件服务器已接收。' if delivered else '暂未确认对方服务器接收，请查看核查记录，勿重发。'
 
 def page(notice=''):
-    if (DATA / 'sender-migration-pending.json').exists():
-        notice = '发信暂停：sales@bedsetco.com 正在同步服务器发件规则，实际投递测试尚未完成。免费采集与草稿编辑可继续。 ' + notice
+    account=mail.settings()
+    account_snapshot=mail.snapshot(account)
+    mail_ready=bool(account['sender_email'] and (account['driver']=='restricted' or account['host']))
+    if account['driver']=='restricted' and (DATA / 'sender-migration-pending.json').exists():
+        notice = '当前邮件接入的发件规则正在同步，暂不能发送。免费采集与草稿编辑可继续。 ' + notice
     esc = html.escape
     with db() as c:
         rows = c.execute('SELECT * FROM leads ORDER BY id DESC').fetchall()
@@ -333,9 +398,13 @@ def page(notice=''):
     state=businesses.initialize()
     profile=next(p for p in state['profiles'] if p['id']==state['active_id'])
     business_form=business_editor(state,profile,TOKEN)
+    mail_form=mail_editor(account,TOKEN)
     profile_fields=(f'<input type="hidden" name="profile_id" value="{esc(profile["id"],quote=True)}">'
                     f'<input type="hidden" name="profile_revision" value="{profile["revision"]}">')
     daily_names='、'.join(p['name'] for p in state['profiles'] if p.get('daily_enabled')) or '暂无（请在业务配置中启用）'
+    daily_description=('此电脑原有每日任务在北京时间 09:30 运行，轮流采集已启用业务，核对后默认发送 1 封合格新客户首信。电脑及 Codex 须保持可运行。'
+                       if (DATA/'schedule.json').exists() else
+                       '勾选业务后可由定时任务调用每日采集入口；新安装需自行配置任务时间和审核发送流程。仅勾选业务或启动工作台不会自动发信。')
     candidates=[]
     result_path=DATA/'found.jsonl'
     if result_path.exists():
@@ -372,19 +441,30 @@ def page(notice=''):
         business_label=f'{r["profile_name"]} · {origin["category"]} · 生成时版本 {origin["revision"]}'
         fields=f'<input type="hidden" name="token" value="{TOKEN}"><input type="hidden" name="id" value="{r["id"]}">'
         editable=r['status'] in ('draft','approved')
+        frozen_mail=json.loads(r['mail_snapshot'] or '{}')
+        needs_binding=frozen_mail.get('fingerprint')!=account_snapshot['fingerprint']
+        mail_label=frozen_mail.get('sender_email') or '尚未绑定发件邮箱'
+        mail_notice='邮件配置已变化，请重建并重新审核。' if editable and needs_binding else ''
         buttons='<button name="action" value="save">保存修改</button>' if editable else ''
-        if r['status']=='draft': buttons+='<button name="action" value="approve">审核通过</button>'
-        if r['status']=='approved': buttons+='<button name="action" value="send" onclick="return confirm(\'将向此联系人发送当前已审核邮件，确定发送？\')">发送此封</button>'
-        if r['message_id']: buttons+='<button name="action" value="audit">核查投递</button>'
+        if editable: buttons+='<button name="action" value="rebuild" onclick="return confirm(\'将按原业务模板和当前邮件配置替换本草稿的主题及正文，之后需要重新审核。确定重建？\')">按当前邮件配置重建草稿</button>'
+        if r['status']=='draft' and mail_ready and not needs_binding: buttons+='<button name="action" value="approve">审核通过</button>'
+        if r['status']=='approved' and mail_ready and not needs_binding: buttons+='<button name="action" value="send" onclick="return confirm(\'将向此联系人发送当前已审核邮件，确定发送？\')">发送此封</button>'
+        if r['message_id']: buttons+='<button name="action" value="audit">查看提交／投递记录</button>'
         buttons+='<button name="action" value="suppress">停用此公司／记录退订</button>'
         disabled='' if editable else ' readonly'
-        cards.append(f'<section><h2>{esc(r["company"])} · {esc(r["email"])}</h2><p class="tag">{esc(business_label)}</p><p>{LABELS[r["status"]]} {esc(r["note"])}</p><form method="post">{fields}<label>邮件主题<input name="subject" value="{esc(r["subject"],quote=True)}"{disabled}></label><label>邮件正文<textarea name="body"{disabled}>{esc(r["body"])}</textarea></label><div>{buttons}</div></form><small>{esc(r["message_id"] or "")}</small></section>')
+        cards.append(f'<section><h2>{esc(r["company"])} · {esc(r["email"])}</h2><p class="tag">{esc(business_label)}</p><p>此草稿发件邮箱：{esc(mail_label)} {esc(mail_notice)}</p><p>{LABELS[r["status"]]} {esc(r["note"])}</p><form method="post">{fields}<label>邮件主题<input name="subject" value="{esc(r["subject"],quote=True)}"{disabled}></label><label>邮件正文<textarea name="body"{disabled}>{esc(r["body"])}</textarea></label><div>{buttons}</div></form><small>{esc(r["message_id"] or "")}</small></section>')
     return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>全品类客户开发</title>
     <style>body{{font:16px system-ui;background:#f7f4ef;color:#302d29;max-width:960px;margin:40px auto;padding:0 24px}}section{{background:white;border:1px solid #ded8cf;padding:24px;margin:20px 0;border-radius:14px}}h1{{font-size:32px}}h2{{font-size:19px}}h3{{font-size:16px;margin-top:24px}}label{{display:block;margin:12px 0}}input,textarea,select{{display:block;box-sizing:border-box;width:100%;padding:12px;font:15px system-ui;border:1px solid #ccc;border-radius:6px}}textarea{{height:140px}}textarea[name="body"],textarea[name="body_template"]{{height:300px}}button{{padding:10px 14px;margin:4px;border:0;border-radius:6px;background:#385747;color:white;cursor:pointer}}small{{color:#777}}.notice{{padding:15px;background:#e5eee7}}a{{color:#385747}}details{{margin:18px 0}}summary{{cursor:pointer}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f4;padding:16px}}.check{{display:flex;align-items:center;gap:8px}}.check input{{width:18px}}.tag{{color:#385747;background:#edf3ef;padding:8px}}table{{font-size:13px;width:100%;table-layout:fixed}}td,th{{overflow-wrap:anywhere;text-align:left;padding:6px}}</style>
-    <h1>全品类客户开发</h1><p>发件邮箱：{SENDER} · 自有邮件服务器 · 当前业务：{esc(profile['name'])}</p>
-    <section><h2>每日自动开发</h2><p>北京时间每天 09:30：按已启用的业务免费搜索官网，核对产品匹配和公开邮箱，去重后自动发送 1 封合格新客户首信，并核查投递。现有 Codex 每日任务执行，电脑及 Codex 须保持可运行。</p><p>已启用业务：{esc(daily_names)}</p><p>所有业务合计每天最多新增 5 家公司；自动任务与本工作台共享提交台账，总提交上限 {LIMIT} 封。没有合格客户或核查失败时记录原因。采集不调用付费数据服务；Codex 自动任务使用你的现有额度。</p></section>
-    <p>手动导入的名单仍先审核再发送。回复与退订须从现有邮箱查看，并在这里记录停用；停用记录同步每日任务的共用台账。</p>
+    <h1>全品类客户开发</h1><p>发件邮箱：{esc(account['sender_email'] or '尚未配置')} · 当前业务：{esc(profile['name'])}</p>
+    {mail_form}
+    <section><h2>每日自动开发</h2><p>{esc(daily_description)}</p><p>已启用业务：{esc(daily_names)}</p><p>每日采集入口每次最多新增 5 家公司；所有业务共享提交台账，每日提交上限 {account['daily_limit']} 封，发送间隔 {account['interval_seconds']} 秒。没有合格客户时跳过发送。采集不调用付费数据服务；使用外部 AI 或 Codex 任务时，由所选服务提供额度。</p></section>
+    <p>客户名单先审核再发送。回复与退订请从自己的邮箱查看，并在这里记录公司停用；停用和发送历史由此安装的所有业务共用。</p>
     <p class="notice">{esc(notice or '导入客户名单后，先修改草稿，再审核和发送。模板不包含未确认的产品参数。')}</p>
+    <section><details><summary>导入已有联系／退订公司名单</summary>
+    <p>若此前已在其他软件发信，可每行填写一个公司域名或邮箱，记录为禁止再联系。按公司域名去重，适用于全部业务。</p>
+    <form method="post"><input type="hidden" name="token" value="{TOKEN}">
+    <textarea name="block_list" placeholder="example.com&#10;contact@example.org"></textarea>
+    <button name="action" value="import_blocks">导入停用名单</button></form></details></section>
     {business_form}{finder_form}{results}<section><h2>导入客户 CSV · {esc(profile['name'])}</h2><p>列名：email,company,name；可选 subject,body。按当前业务生成草稿。<a href="/sample.csv">下载空白模板</a></p>
     <form method="post"><input type="hidden" name="token" value="{TOKEN}">{profile_fields}<textarea name="csv" placeholder="粘贴 CSV 内容"></textarea><button name="action" value="import">为当前业务导入并生成草稿</button></form></section>
     <h2>客户草稿与历史（所有业务）</h2>
@@ -431,8 +511,12 @@ class Handler(BaseHTTPRequestHandler):
             elif action=='profile_save': notice=businesses.save(values)
             elif action=='profile_templates': notice=businesses.reset_templates(values['profile_id'],values['profile_revision'])
             elif action=='config': notice=finder.save(values)
+            elif action=='mail_save': notice=mail.save(values)
+            elif action=='mail_check': notice=mail.check_connection()
+            elif action=='import_blocks': notice=import_blocks(values.get('block_list',''))
             elif action=='find': notice=finder.start(values.get('count','3'),profile_id=values.get('profile_id'),revision=values.get('profile_revision'))
             elif action=='save': update(row_id,values);notice='已保存修改，请重新审核。'
+            elif action=='rebuild': notice=rebuild(row_id)
             elif action=='approve': approve(row_id);notice='审核通过。点击发送此封才会发信。'
             elif action=='send': notice=send(row_id)
             elif action=='suppress': suppress(row_id);notice='已停用此公司，后续导入或发送将被阻止。'
@@ -449,6 +533,7 @@ def main():
     parser.add_argument('--port',type=int,default=8766)
     parser.add_argument('--no-browser',action='store_true')
     args=parser.parse_args()
+    mail.settings()  # No server connection, authentication or sending on startup.
     finder.settings()  # Migrate the old search configuration before opening the queue.
     with db(): pass
     url=f'http://127.0.0.1:{args.port}'
