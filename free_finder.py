@@ -10,7 +10,7 @@ from urllib.request import getproxies
 from urllib.robotparser import RobotFileParser
 import requests
 
-UA = 'BedSetCoResearch/1.0'
+UA = 'OpenOutreachWorkbench/2.0'
 MAX_BYTES = 4_000_000
 EMAIL = re.compile(r'[A-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}', re.I)
 BLOCKED = ('bing.com','google.com','duckduckgo.com','facebook.com','linkedin.com',
@@ -137,11 +137,13 @@ def search_destination(link,engine):
         except (ValueError,UnicodeError):return ''
     return link if urlparse(link).scheme in ('http','https') else ''
 
-def discover(web,queries):
+def discover(web,queries,deadline=None):
     urls=[]
     for query in queries[:4]:
+        if deadline is not None and time.monotonic()>=deadline:break
         for engine,base in (('duckduckgo','https://html.duckduckgo.com/html/?'),
                             ('bing','https://www.bing.com/search?')):
+            if deadline is not None and time.monotonic()>=deadline:break
             try:
                 status,_,raw=web.fetch(base+urlencode({'q':query}),False)
                 if status!=200:continue
@@ -154,12 +156,13 @@ def discover(web,queries):
     return list(dict.fromkeys(urls))
 
 def find(count,config,progress=lambda _:None,exclude_domains=()):
+    deadline=time.monotonic()+min(600,max(1,float(config.get('budget_seconds',600))))
     web=Web()
     queries=[q.strip() for q in config.get('queries','').splitlines() if q.strip()]
     seeds=[q.strip() for q in config.get('websites','').splitlines() if q.strip()]
     progress('正在搜索公开公司网站……')
-    urls=seeds[:30]+discover(web,queries)
-    domains=set();records=[];deadline=time.monotonic()+600
+    urls=seeds[:30]+discover(web,queries,deadline)
+    domains=set();records=[]
     excluded=set(exclude_domains)
     for url in urls[:30]:
         if len(records)>=count or time.monotonic()>deadline:break
@@ -183,6 +186,7 @@ def find(count,config,progress=lambda _:None,exclude_domains=()):
                 if host(absolute)==domain and any(k in absolute.lower() for k in ('contact','about','wholesale','trade')):
                     if absolute not in links:links.append(absolute)
             for link in links[:3]:
+                if time.monotonic()>=deadline:break
                 try:
                     code,source,body=web.fetch(link)
                     if code==200 and host(source)==domain:

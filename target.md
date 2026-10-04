@@ -1,4 +1,9 @@
-# Target buyers (initial editable profile)
+# Legacy bedding target example
+Runtime targets now come from each private business profile in
+data/business-profiles.json. Existing deployments copy this file into their
+initial bedding profile during migration; it is not a global category filter.
+
+## Target buyers (initial bedding profile)
 Find business decision makers responsible for bedding sourcing at home textile
 retailers, bedding distributors, bedding brands, and importers.
 Prefer purchasing, procurement, category and sourcing roles relevant to bedding.

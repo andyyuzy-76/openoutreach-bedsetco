@@ -1,4 +1,4 @@
-"""BedSetCo queue with shared daily automation accounting and restricted transport."""
+"""Multi-category outreach queue with shared accounting and restricted transport."""
 from __future__ import annotations
 import argparse
 import csv
@@ -14,11 +14,14 @@ import sqlite3
 import subprocess
 import threading
 import finder
+import business_profiles as businesses
+from profile_ui import editor as business_editor
 import webbrowser
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import format_datetime, make_msgid
+from email.headerregistry import Address
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -44,6 +47,20 @@ def db():
       submitted_at TEXT, note TEXT DEFAULT '');
       CREATE TABLE IF NOT EXISTS blocks (domain TEXT PRIMARY KEY, reason TEXT);
       CREATE TABLE IF NOT EXISTS events (at TEXT, lead_id INTEGER, action TEXT, detail TEXT);''')
+    columns={r['name'] for r in c.execute('PRAGMA table_info(leads)')}
+    if not {'profile_id','profile_name','profile_snapshot'}.issubset(columns):
+        c.execute('BEGIN IMMEDIATE')
+        columns={r['name'] for r in c.execute('PRAGMA table_info(leads)')}
+        for name,definition in (('profile_id',"TEXT NOT NULL DEFAULT 'bedsetco-bedding'"),
+                                ('profile_name',"TEXT NOT NULL DEFAULT 'BedSetCo 床品'"),
+                                ('profile_snapshot',"TEXT NOT NULL DEFAULT ''")):
+            if name not in columns:
+                c.execute(f'ALTER TABLE leads ADD COLUMN {name} {definition}')
+        snapshot=json.dumps(businesses.legacy_snapshot(),ensure_ascii=False,sort_keys=True)
+        c.execute("UPDATE leads SET profile_snapshot=? WHERE profile_snapshot=''",(snapshot,))
+        # Include the frozen business identity in new approvals. Re-review old approvals.
+        c.execute("UPDATE leads SET status='draft',approval=NULL WHERE status='approved'")
+        c.commit()
     return c
 
 def event(c, row_id, action, detail=''):
@@ -51,8 +68,21 @@ def event(c, row_id, action, detail=''):
               (datetime.now().astimezone().isoformat(), row_id, action, detail))
 
 def digest(row):
-    return hashlib.sha256(json.dumps([row['email'],row['subject'],row['body']],
+    return hashlib.sha256(json.dumps([row['email'],row['subject'],row['body'],row['profile_snapshot']],
                          ensure_ascii=False).encode()).hexdigest()
+
+def lead_business(row):
+    profile=json.loads(row['profile_snapshot'])
+    if profile.get('id')!=row['profile_id']:
+        raise ValueError('客户业务记录异常，请核查原草稿')
+    return profile
+
+def automated_business(row):
+    frozen=lead_business(row)
+    current=businesses.require_ready(businesses.get(row['profile_id']))
+    if not current.get('daily_enabled') or current['revision']!=frozen['revision']:
+        raise ValueError('此业务已停用或配置已变更，自动任务须重新核对并准备新草稿')
+    return frozen
 
 def address(value):
     value = value.strip().lower()
@@ -120,34 +150,40 @@ def blocked_reason(c, row):
         return '此公司已有提交记录，不再发送首封开发信'
     return ''
 
-def import_csv(text):
+def import_csv(text,profile=None):
+    profile=businesses.require_ready(profile or businesses.get())
     reader = csv.DictReader(io.StringIO(text.lstrip('\ufeff')))
     if not reader.fieldnames or not {'email','company'}.issubset(reader.fieldnames):
         raise ValueError('CSV 必须包含 email、company 列；可选 name、subject、body')
     count = skipped = 0
+    historical=history_blocks()
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        existing={r[0] for r in c.execute('SELECT domain FROM leads')}
+        existing.update(r[0] for r in c.execute('SELECT domain FROM blocks'))
         for row in reader:
-            email = address(row.get('email',''))
-            company = row['company'].strip()
-            name = row.get('name','').strip()
+            selected=profile
+            if (row.get('profile_id') or '').strip():
+                if row['profile_id'].strip()!=profile['id']:
+                    raise ValueError('CSV 中的 profile_id 与本次业务不同，请按业务分别导入')
+            email = address(row.get('email') or '')
+            company = (row.get('company') or '').strip()
+            name = (row.get('name') or '').strip()
             if not company or '\n' in company or '\r' in company:
                 raise ValueError('公司名称不能为空或包含换行')
-            subject = row.get('subject','').strip() or f'Bedding sourcing contact at {company}'
-            body = row.get('body','').strip() or (
-                f'Hi {name or "there"},\n\n'
-                f'I’m reaching out from BedSetCo, a home textile business focused on bedding sets. '
-                f'Could you point me to the person who handles bedding sourcing at {company}?\n\n'
-                'If this is relevant, I’d be happy to share information about specific products '\
-                'based on your requirements.\n\nBest regards,\nBedSetCo\n'
-                f'{SENDER}\nhttps://bedsetco.com\n\n'
-                'If you prefer not to receive further emails, please reply “unsubscribe”.')
+            default_subject,default_body=businesses.render(selected,company,name)
+            subject = (row.get('subject') or '').strip() or default_subject
+            body = (row.get('body') or '').strip() or default_body
             if '\n' in subject or '\r' in subject or len(body)>30000:
                 raise ValueError('主题不能换行，正文不得超过 30000 字符')
-            if email.split('@')[-1] in history_blocks():
+            domain=email.split('@')[-1]
+            if any(domain==d or domain.endswith('.'+d) or d.endswith('.'+domain) for d in historical|existing):
                 skipped += 1
                 continue
-            cur = c.execute('INSERT OR IGNORE INTO leads (email,company,domain,name,subject,body) VALUES (?,?,?,?,?,?)',
-                            (email,company,email.split('@')[-1],name,subject,body))
+            cur = c.execute('INSERT OR IGNORE INTO leads (email,company,domain,name,subject,body,profile_id,profile_name,profile_snapshot) VALUES (?,?,?,?,?,?,?,?,?)',
+                            (email,company,domain,name,subject,body,selected['id'],selected['name'],
+                             json.dumps(selected,ensure_ascii=False,sort_keys=True)))
+            existing.add(domain)
             count += cur.rowcount
             skipped += not cur.rowcount
     return f'已导入 {count} 位联系人，跳过 {skipped} 位已有记录的联系人。所有新草稿均待审核。'
@@ -163,11 +199,13 @@ def update(row_id, values):
         c.execute("UPDATE leads SET subject=?,body=?,status='draft',approval=NULL WHERE id=?",(subject,body,row_id))
         event(c,row_id,'edit')
 
-def approve(row_id):
+def approve(row_id, *, automated=False):
     with db() as c:
         row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
         if not row or row['status']!='draft':
             raise ValueError('仅可审核待审核草稿')
+        if automated:
+            automated_business(row)
         if reason := blocked_reason(c,row):
             raise ValueError(reason)
         c.execute("UPDATE leads SET status='approved',approval=? WHERE id=?",(digest(row),row_id))
@@ -185,7 +223,7 @@ def suppress(row_id):
             'company':row['company'],'domains':[row['domain']],'recipient':row['email'],
             'reason':'用户停用／退订','action':'禁止再联系'})
 
-def send(row_id):
+def send(row_id, *, automated=False):
     if (DATA / 'sender-migration-pending.json').exists():
         raise ValueError('sales@bedsetco.com 发件切换待服务器规则同步，当前暂停发送。')
     script = OPS / 'importyeti-mail-send.ps1'
@@ -208,6 +246,8 @@ def send(row_id):
         row = c.execute('SELECT * FROM leads WHERE id=?',(row_id,)).fetchone()
         if not row or row['status']!='approved' or row['approval']!=digest(row):
             raise ValueError('须先审核当前版本；已提交的邮件不能重发')
+        if automated:
+            automated_business(row)
         if reason := blocked_reason(c,row):
             raise ValueError(reason)
         n = shared_submissions_today(c)
@@ -217,7 +257,8 @@ def send(row_id):
         if last and datetime.now().astimezone()-datetime.fromisoformat(last)<timedelta(minutes=4):
             raise ValueError('两封新邮件至少间隔 4 分钟，请稍后发送')
         message = EmailMessage(policy=SMTP)
-        message['From'] = f'BedSetCo <{SENDER}>'
+        profile=lead_business(row)
+        message['From'] = Address(display_name=profile.get('sender_name') or profile['brand'],addr_spec=SENDER)
         message['Reply-To'] = SENDER
         message['To'] = row['email']
         message['Subject'] = row['subject']
@@ -240,6 +281,8 @@ def send(row_id):
         ledger_append({'event':'submission_started','timestamp':datetime.now().astimezone().isoformat(),
             'company':row['company'],'domains':[row['domain']],'recipient':row['email'],
             'from':SENDER,'message_id':message['Message-ID'],'message_path':str(eml),
+            'profile_id':row['profile_id'],'profile_name':row['profile_name'],
+            'category':profile['category'],'profile_revision':profile['revision'],
             'channel':'restricted-self-hosted-wrapper','action':'未发/待验收'})
     # State is persisted before transport; crash/timeout must never cause an automatic retry.
     state,note = 'uncertain','提交结果不明，请按 Message-ID 查询服务器记录，勿重发。'
@@ -287,15 +330,20 @@ def page(notice=''):
     with db() as c:
         rows = c.execute('SELECT * FROM leads ORDER BY id DESC').fetchall()
     config=finder.settings()
-    target=(ROOT/'target.md').read_text(encoding='utf-8')
+    state=businesses.initialize()
+    profile=next(p for p in state['profiles'] if p['id']==state['active_id'])
+    business_form=business_editor(state,profile,TOKEN)
+    profile_fields=(f'<input type="hidden" name="profile_id" value="{esc(profile["id"],quote=True)}">'
+                    f'<input type="hidden" name="profile_revision" value="{profile["revision"]}">')
+    daily_names='、'.join(p['name'] for p in state['profiles'] if p.get('daily_enabled')) or '暂无（请在业务配置中启用）'
     candidates=[]
     result_path=DATA/'found.jsonl'
     if result_path.exists():
         for line in result_path.read_text(encoding='utf-8').splitlines()[-20:]:
             record=json.loads(line)
             candidates.append('<tr>'+''.join(f'<td>{esc(str(record.get(k) or ""))}</td>'
-                for k in ('company','full_name','email','source_url','reason'))+'</tr>')
-    results=('<section><h2>最近找到的候选客户</h2><table><tr><th>公司</th><th>姓名</th><th>邮箱</th><th>官网来源</th><th>说明（需人工核对）</th></tr>'
+                for k in ('profile_name','company','email','source_url','reason'))+'</tr>')
+    results=('<section><h2>最近找到的候选客户</h2><table><tr><th>业务</th><th>公司</th><th>邮箱</th><th>官网来源</th><th>说明（需核对）</th></tr>'
              +''.join(candidates)+'</table></section>') if candidates else ''
     ai_status='AI 密钥已保存。' if config['llm_key'] else 'AI 密钥未配置。'
     test_path=finder.DATA/'ai-test.json'
@@ -304,22 +352,24 @@ def page(notice=''):
         if report.get('model')==config['model'] and report.get('base')==config['base'] and report.get('structured_test')=='passed':
             ai_status+=' NewAPI 实际调用与结构化输出测试通过。'
     data_status='免费官网采集已启用，不需要数据服务密钥，也不调用 AI。'
-    finder_form=f'''<section><h2>自动找客户</h2><p>{esc(ai_status+' '+data_status)}</p><p>{esc(finder.JOB['notice'])}</p>
+    finder_form=f'''<section><h2>免费找客户 · {esc(profile['name'])}</h2><p>{esc(data_status)}</p><p>{esc(finder.JOB['notice'])}</p>
+    <p>按当前业务的品类、目标市场、客户类型及搜索设置采集。填写并保存业务配置后开始。</p>
+    <form method="post"><input type="hidden" name="token" value="{TOKEN}">{profile_fields}
+    <label>本次数量（1–10）<input name="count" type="number" min="1" max="10" value="3"></label>
+    <button name="action" value="find">为当前业务免费找客户</button></form>
+    <p><a href="/">刷新运行状态</a> · 每次最多扫描 30 家候选公司。官网公开邮箱仍需核对业务和用途；此按钮只生成草稿。</p>
+    <details><summary>NewAPI 共用设置</summary><p>{esc(ai_status)}</p>
     <form method="post"><input type="hidden" name="token" value="{TOKEN}">
     <label>AI 模型（例如 openai_compatible:模型名称）<input name="model" value="{esc(config['model'],quote=True)}"></label>
     <label>AI 接口地址<input name="base" value="{esc(config['base'],quote=True)}"></label>
     <label>AI 密钥（留空保留已保存的密钥）<input type="password" name="llm_key" autocomplete="new-password"></label>
-    <label>搜索词（每行一组，建议包含国家、床品业务及 contact）<textarea name="queries">{esc(config.get('queries',''))}</textarea></label>
-    <label>公司官网网址（可选，每行一个完整 https:// 地址，最多 30 个）<textarea name="websites">{esc(config.get('websites',''))}</textarea></label>
-    <label>目标客户描述（供人工审核参考；采集按上面的搜索词查找）<textarea name="target">{esc(target)}</textarea></label>
-    <button name="action" value="config">保存找客户配置</button></form>
+    <button name="action" value="config">保存 NewAPI 设置</button></form>
     <p>免费模式仅访问公开搜索页面和公司官网，遵守官网抓取规则。不会调用 BetterContact 或 AI，不产生这些服务的调用费用。NewAPI 配置保留供后续 AI 功能使用。</p>
-    <form method="post"><input type="hidden" name="token" value="{TOKEN}">
-    <label>本次数量（1–10）<input name="count" type="number" min="1" max="10" value="3"></label>
-    <button name="action" value="find">免费找客户并采集邮箱</button></form>
-    <p><a href="/">刷新运行状态</a> · 公开邮箱未经投递验证；可能找不到邮箱。最多扫描 30 家候选公司，约 10 分钟后停止继续扫描，不会自动发送邮件。</p></section>'''
+    </details></section>'''
     cards=[]
     for r in rows:
+        origin=lead_business(r)
+        business_label=f'{r["profile_name"]} · {origin["category"]} · 生成时版本 {origin["revision"]}'
         fields=f'<input type="hidden" name="token" value="{TOKEN}"><input type="hidden" name="id" value="{r["id"]}">'
         editable=r['status'] in ('draft','approved')
         buttons='<button name="action" value="save">保存修改</button>' if editable else ''
@@ -328,15 +378,16 @@ def page(notice=''):
         if r['message_id']: buttons+='<button name="action" value="audit">核查投递</button>'
         buttons+='<button name="action" value="suppress">停用此公司／记录退订</button>'
         disabled='' if editable else ' readonly'
-        cards.append(f'<section><h2>{esc(r["company"])} · {esc(r["email"])}</h2><p>{LABELS[r["status"]]} {esc(r["note"])}</p><form method="post">{fields}<label>英文主题<input name="subject" value="{esc(r["subject"],quote=True)}"{disabled}></label><label>英文正文<textarea name="body"{disabled}>{esc(r["body"])}</textarea></label><div>{buttons}</div></form><small>{esc(r["message_id"] or "")}</small></section>')
-    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>BedSetCo 客户开发</title>
-    <style>body{{font:16px system-ui;background:#f7f4ef;color:#302d29;max-width:960px;margin:40px auto;padding:0 24px}}section{{background:white;border:1px solid #ded8cf;padding:24px;margin:20px 0;border-radius:14px}}h1{{font-size:32px}}h2{{font-size:19px}}label{{display:block;margin:12px 0}}input,textarea{{display:block;box-sizing:border-box;width:100%;padding:12px;font:15px system-ui;border:1px solid #ccc;border-radius:6px}}textarea{{height:250px}}button{{padding:10px 14px;margin:4px;border:0;border-radius:6px;background:#385747;color:white;cursor:pointer}}small{{color:#777}}.notice{{padding:15px;background:#e5eee7}}a{{color:#385747}}</style>
-    <h1>BedSetCo 客户开发</h1><p>发件人：{SENDER} · 自有邮件服务器</p>
-    <section><h2>每日自动开发</h2><p>北京时间每天 09:30：免费搜索公司官网，核对业务与公开邮箱，去重后自动发送 1 封合格新客户首信，并核查投递。由现有 Codex 每日任务执行，电脑及 Codex 须保持可运行。</p><p>每日最多新增 5 家公司；自动任务与本工作台共享提交台账，总提交上限 {LIMIT} 封。没有合格客户或发信核查失败时跳过，并记录原因。采集不调用付费数据服务；Codex 自动任务使用你的现有额度。</p></section>
+        cards.append(f'<section><h2>{esc(r["company"])} · {esc(r["email"])}</h2><p class="tag">{esc(business_label)}</p><p>{LABELS[r["status"]]} {esc(r["note"])}</p><form method="post">{fields}<label>邮件主题<input name="subject" value="{esc(r["subject"],quote=True)}"{disabled}></label><label>邮件正文<textarea name="body"{disabled}>{esc(r["body"])}</textarea></label><div>{buttons}</div></form><small>{esc(r["message_id"] or "")}</small></section>')
+    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>全品类客户开发</title>
+    <style>body{{font:16px system-ui;background:#f7f4ef;color:#302d29;max-width:960px;margin:40px auto;padding:0 24px}}section{{background:white;border:1px solid #ded8cf;padding:24px;margin:20px 0;border-radius:14px}}h1{{font-size:32px}}h2{{font-size:19px}}h3{{font-size:16px;margin-top:24px}}label{{display:block;margin:12px 0}}input,textarea,select{{display:block;box-sizing:border-box;width:100%;padding:12px;font:15px system-ui;border:1px solid #ccc;border-radius:6px}}textarea{{height:140px}}textarea[name="body"],textarea[name="body_template"]{{height:300px}}button{{padding:10px 14px;margin:4px;border:0;border-radius:6px;background:#385747;color:white;cursor:pointer}}small{{color:#777}}.notice{{padding:15px;background:#e5eee7}}a{{color:#385747}}details{{margin:18px 0}}summary{{cursor:pointer}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f4;padding:16px}}.check{{display:flex;align-items:center;gap:8px}}.check input{{width:18px}}.tag{{color:#385747;background:#edf3ef;padding:8px}}table{{font-size:13px;width:100%;table-layout:fixed}}td,th{{overflow-wrap:anywhere;text-align:left;padding:6px}}</style>
+    <h1>全品类客户开发</h1><p>发件邮箱：{SENDER} · 自有邮件服务器 · 当前业务：{esc(profile['name'])}</p>
+    <section><h2>每日自动开发</h2><p>北京时间每天 09:30：按已启用的业务免费搜索官网，核对产品匹配和公开邮箱，去重后自动发送 1 封合格新客户首信，并核查投递。现有 Codex 每日任务执行，电脑及 Codex 须保持可运行。</p><p>已启用业务：{esc(daily_names)}</p><p>所有业务合计每天最多新增 5 家公司；自动任务与本工作台共享提交台账，总提交上限 {LIMIT} 封。没有合格客户或核查失败时记录原因。采集不调用付费数据服务；Codex 自动任务使用你的现有额度。</p></section>
     <p>手动导入的名单仍先审核再发送。回复与退订须从现有邮箱查看，并在这里记录停用；停用记录同步每日任务的共用台账。</p>
     <p class="notice">{esc(notice or '导入客户名单后，先修改草稿，再审核和发送。模板不包含未确认的产品参数。')}</p>
-    {finder_form}{results}<section><h2>导入客户 CSV</h2><p>列名：email,company,name；可选 subject,body。<a href="/sample.csv">下载空白模板</a></p>
-    <form method="post"><input type="hidden" name="token" value="{TOKEN}"><textarea name="csv" placeholder="粘贴 CSV 内容"></textarea><button name="action" value="import">导入并生成草稿</button></form></section>
+    {business_form}{finder_form}{results}<section><h2>导入客户 CSV · {esc(profile['name'])}</h2><p>列名：email,company,name；可选 subject,body。按当前业务生成草稿。<a href="/sample.csv">下载空白模板</a></p>
+    <form method="post"><input type="hidden" name="token" value="{TOKEN}">{profile_fields}<textarea name="csv" placeholder="粘贴 CSV 内容"></textarea><button name="action" value="import">为当前业务导入并生成草稿</button></form></section>
+    <h2>客户草稿与历史（所有业务）</h2>
     {''.join(cards) or '<p>暂无联系人。现有历史发信名单仅用于去重，不会自动加入新队列。</p>'}</html>'''
 
 class Handler(BaseHTTPRequestHandler):
@@ -370,9 +421,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403);return
         try:
             action=values['action'];row_id=int(values.get('id') or 0)
-            if action=='import': notice=import_csv(values['csv'])
+            if action=='import':
+                profile=businesses.get(values.get('profile_id'))
+                if str(profile['revision'])!=values.get('profile_revision'):
+                    raise ValueError('业务配置已变更，请刷新页面后重新导入')
+                notice=import_csv(values['csv'],profile=profile)
+            elif action=='profile_create': notice=businesses.create(values.get('new_profile_name',''))
+            elif action=='profile_select': notice=businesses.select(values['profile_id'])
+            elif action=='profile_save': notice=businesses.save(values)
+            elif action=='profile_templates': notice=businesses.reset_templates(values['profile_id'],values['profile_revision'])
             elif action=='config': notice=finder.save(values)
-            elif action=='find': notice=finder.start(values.get('count','3'))
+            elif action=='find': notice=finder.start(values.get('count','3'),profile_id=values.get('profile_id'),revision=values.get('profile_revision'))
             elif action=='save': update(row_id,values);notice='已保存修改，请重新审核。'
             elif action=='approve': approve(row_id);notice='审核通过。点击发送此封才会发信。'
             elif action=='send': notice=send(row_id)
@@ -386,10 +445,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 def main():
-    parser=argparse.ArgumentParser(description='BedSetCo 本地客户开发工作台')
+    parser=argparse.ArgumentParser(description='全品类本地客户开发工作台')
     parser.add_argument('--port',type=int,default=8766)
     parser.add_argument('--no-browser',action='store_true')
     args=parser.parse_args()
+    finder.settings()  # Migrate the old search configuration before opening the queue.
     with db(): pass
     url=f'http://127.0.0.1:{args.port}'
     try:
@@ -399,7 +459,7 @@ def main():
         if not args.no_browser: webbrowser.open(url)
         return
     (DATA/'workbench.pid').write_text(str(os.getpid()),encoding='ascii')
-    print(f'BedSetCo 工作台：{url}',flush=True)
+    print(f'全品类客户开发工作台：{url}',flush=True)
     if not args.no_browser:
         threading.Timer(0.7,lambda:webbrowser.open(url)).start()
     server.serve_forever()
