@@ -17,6 +17,8 @@ from profile_ui import editor as business_editor
 import mail_transport as mail
 import private_store
 from mail_ui import editor as mail_editor
+import daily_settings
+from daily_ui import editor as daily_editor
 import webbrowser
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -297,6 +299,9 @@ def suppress(row_id):
 def send(row_id, *, automated=False):
     with mail.locked('mail'):
         config=mail.require_ready()
+        policy=daily_settings.settings(config)
+        if automated and policy['daily_target']==0:
+            raise ValueError('每日自动发送已暂停（每天自动发信数量为 0）')
         mail.refresh_history(config)
         with db() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -309,9 +314,12 @@ def send(row_id, *, automated=False):
                 automated_business(row)
             if reason:=blocked_reason(c,row):
                 raise ValueError(reason)
-            limit=config['daily_limit']
-            if shared_submissions_today(c)>=limit:
+            limit=policy['daily_limit']
+            used=shared_submissions_today(c)
+            if used>=limit:
                 raise ValueError(f'每日合计提交上限为 {limit} 封，今天已用完')
+            if automated and used>=policy['daily_target']:
+                raise ValueError(f'每天自动发信数量为 {policy["daily_target"]} 封，今天已用完')
             last=c.execute('SELECT max(submitted_at) FROM leads').fetchone()[0]
             stamps=[datetime.fromisoformat(last)] if last else []
             ledger=mail.ledger_path()
@@ -321,8 +329,8 @@ def send(row_id, *, automated=False):
                     item=json.loads(line)
                     if item.get('event')=='submission_started':
                         stamps.append(datetime.fromisoformat(item['timestamp']))
-            if stamps and datetime.now().astimezone()-max(stamps)<timedelta(seconds=config['interval_seconds']):
-                raise ValueError(f'两次提交至少间隔 {config["interval_seconds"]} 秒，请稍后发送')
+            if stamps and datetime.now().astimezone()-max(stamps)<timedelta(seconds=policy['interval_seconds']):
+                raise ValueError(f'两次提交至少间隔 {policy["interval_seconds"]} 秒，请稍后发送')
             profile=lead_business(row)
             sender=config['sender_email']
             message=EmailMessage(policy=SMTP)
@@ -353,6 +361,7 @@ def send(row_id, *, automated=False):
                 'message_id':message['Message-ID'],'message_path':str(eml),
                 'profile_id':row['profile_id'],'profile_name':row['profile_name'],
                 'category':profile['category'],'profile_revision':profile['revision'],
+                'daily_revision':policy['revision'],'daily_target':policy['daily_target'],
                 'channel':config['driver'],'action':'未发/待验收'})
         # Both the message and an irreversible submission state exist before contacting
         # the server. Configuration is locked until this one attempt has completed.
@@ -394,6 +403,12 @@ def page(notice=''):
     esc = html.escape
     with db() as c:
         rows = c.execute('SELECT * FROM leads ORDER BY id DESC').fetchall()
+        try:
+            submitted_today=shared_submissions_today(c)
+            count_error=''
+        except (ValueError, OSError, KeyError) as exc:
+            submitted_today=None
+            count_error=str(exc)
     config=finder.settings()
     state=businesses.initialize()
     profile=next(p for p in state['profiles'] if p['id']==state['active_id'])
@@ -402,9 +417,7 @@ def page(notice=''):
     profile_fields=(f'<input type="hidden" name="profile_id" value="{esc(profile["id"],quote=True)}">'
                     f'<input type="hidden" name="profile_revision" value="{profile["revision"]}">')
     daily_names='、'.join(p['name'] for p in state['profiles'] if p.get('daily_enabled')) or '暂无（请在业务配置中启用）'
-    daily_description=('此电脑原有每日任务在北京时间 09:30 运行，轮流采集已启用业务，核对后默认发送 1 封合格新客户首信。电脑及 Codex 须保持可运行。'
-                       if (DATA/'schedule.json').exists() else
-                       '勾选业务后可由定时任务调用每日采集入口；新安装需自行配置任务时间和审核发送流程。仅勾选业务或启动工作台不会自动发信。')
+    daily_form=daily_editor(daily_settings.settings(account),TOKEN,daily_names,submitted_today,count_error)
     candidates=[]
     result_path=DATA/'found.jsonl'
     if result_path.exists():
@@ -457,7 +470,7 @@ def page(notice=''):
     <style>body{{font:16px system-ui;background:#f7f4ef;color:#302d29;max-width:960px;margin:40px auto;padding:0 24px}}section{{background:white;border:1px solid #ded8cf;padding:24px;margin:20px 0;border-radius:14px}}h1{{font-size:32px}}h2{{font-size:19px}}h3{{font-size:16px;margin-top:24px}}label{{display:block;margin:12px 0}}input,textarea,select{{display:block;box-sizing:border-box;width:100%;padding:12px;font:15px system-ui;border:1px solid #ccc;border-radius:6px}}textarea{{height:140px}}textarea[name="body"],textarea[name="body_template"]{{height:300px}}button{{padding:10px 14px;margin:4px;border:0;border-radius:6px;background:#385747;color:white;cursor:pointer}}small{{color:#777}}.notice{{padding:15px;background:#e5eee7}}a{{color:#385747}}details{{margin:18px 0}}summary{{cursor:pointer}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f4;padding:16px}}.check{{display:flex;align-items:center;gap:8px}}.check input{{width:18px}}.tag{{color:#385747;background:#edf3ef;padding:8px}}table{{font-size:13px;width:100%;table-layout:fixed}}td,th{{overflow-wrap:anywhere;text-align:left;padding:6px}}</style>
     <h1>全品类客户开发</h1><p>发件邮箱：{esc(account['sender_email'] or '尚未配置')} · 当前业务：{esc(profile['name'])}</p>
     {mail_form}
-    <section><h2>每日自动开发</h2><p>{esc(daily_description)}</p><p>已启用业务：{esc(daily_names)}</p><p>每日采集入口每次最多新增 5 家公司；所有业务共享提交台账，每日提交上限 {account['daily_limit']} 封，发送间隔 {account['interval_seconds']} 秒。没有合格客户时跳过发送。采集不调用付费数据服务；使用外部 AI 或 Codex 任务时，由所选服务提供额度。</p></section>
+    {daily_form}
     <p>客户名单先审核再发送。回复与退订请从自己的邮箱查看，并在这里记录公司停用；停用和发送历史由此安装的所有业务共用。</p>
     <p class="notice">{esc(notice or '导入客户名单后，先修改草稿，再审核和发送。模板不包含未确认的产品参数。')}</p>
     <section><details><summary>导入已有联系／退订公司名单</summary>
@@ -513,6 +526,7 @@ class Handler(BaseHTTPRequestHandler):
             elif action=='config': notice=finder.save(values)
             elif action=='mail_save': notice=mail.save(values)
             elif action=='mail_check': notice=mail.check_connection()
+            elif action=='daily_save': notice=daily_settings.save(values)
             elif action=='import_blocks': notice=import_blocks(values.get('block_list',''))
             elif action=='find': notice=finder.start(values.get('count','3'),profile_id=values.get('profile_id'),revision=values.get('profile_revision'))
             elif action=='save': update(row_id,values);notice='已保存修改，请重新审核。'

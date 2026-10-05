@@ -113,11 +113,13 @@ def save(values):
         config['driver'] = 'smtp'
         for key in ('host', 'security', 'username', 'sender_email', 'reply_to', 'display_name'):
             config[key] = values.get(key, '').strip()
-        for key in ('port', 'daily_limit', 'interval_seconds', 'timeout'):
+        # Quotas now belong to daily_settings. Keep the legacy values in this
+        # snapshot stable, so changing quantity does not change a draft's account.
+        for key in ('port', 'timeout'):
             try:
                 config[key] = int(values.get(key, str(DEFAULT[key])))
             except ValueError:
-                raise ValueError('端口、上限、间隔和超时须为整数') from None
+                raise ValueError('端口和超时须为整数') from None
         config['use_auth'] = values.get('use_auth') == 'on'
         new_password = values.get('smtp_password', '')
         changed_server = old['driver'] != 'smtp' or any(config[k] != old[k] for k in ('host', 'port', 'security', 'username'))

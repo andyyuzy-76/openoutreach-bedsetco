@@ -68,7 +68,7 @@ def editor(state, profile, token):
     {field('subject_template','主题模板')}{field('body_template','正文模板',True)}
     <p>保留回复 unsubscribe 的退出说明。修改业务配置只影响新草稿；历史客户和已提交邮件保留原始业务记录。</p></details>
     <label class="check"><input type="checkbox" name="daily_enabled"{auto}>加入每日自动开发</label>
-    <p>已配置的每日任务可轮流采集这些业务，每次最多新增 5 家。任务时间和发送步骤需另行配置；勾选此项不会直接发信。</p>
+    <p>已配置的每日任务按「每日自动开发」中保存的数量轮流采集和审核发送。新安装需另行配置任务；勾选此项不会立即发信。</p>
     <button name="action" value="profile_save">保存当前业务配置</button></form>
     <form method="post">{hidden}<button name="action" value="profile_templates">按已保存的语言恢复默认邮件模板</button></form>
     {preview}</section>'''

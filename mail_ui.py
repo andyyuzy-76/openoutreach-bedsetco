@@ -41,8 +41,6 @@ def editor(config, token):
     {field('sender_email','发件邮箱（From，须为服务器允许使用的地址）','email')}
     {field('reply_to','回复邮箱（Reply-To，留空使用发件邮箱）','email')}
     {field('display_name','发件显示名称（可选，留空使用对应业务的署名）')}
-    {field('daily_limit','所有业务合计每日提交上限','number','min="1" max="10000"')}
-    {field('interval_seconds','两次邮件提交的最小间隔（秒）','number','min="0" max="86400"')}
     {field('timeout','连接与通信超时（秒）','number','min="5" max="120"')}
     <button name="action" value="mail_save">保存邮件服务器</button></form>
     <form method="post">{hidden}<button name="action" value="mail_check">检查已保存配置的连接（不发信）</button></form>

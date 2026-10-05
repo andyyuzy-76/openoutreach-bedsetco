@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+from datetime import datetime
 import business_profiles as businesses
 import mail_transport
 import private_store
@@ -85,6 +86,7 @@ def start(count,paid=False,profile_id=None,revision=None):
             records=find(count,config,lambda message: JOB.update(notice=f'「{profile["name"]}」：'+message),exclude_domains=excluded)
             for record in records:
                 businesses.tag(record,profile)
+                record['discovered_at']=datetime.now().astimezone().isoformat()
             DATA.mkdir(exist_ok=True)
             with (DATA/'found.jsonl').open('a',encoding='utf-8') as out:
                 for record in records: out.write(json.dumps(record,ensure_ascii=False)+'\n')
